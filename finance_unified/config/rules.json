@@ -1,0 +1,16 @@
+{
+  "default_positions": {
+    "空仓": 0,
+    "卖出": 10,
+    "减仓": 30,
+    "持有": 50,
+    "加仓": 70,
+    "买入": 80
+  },
+  "history_forward_days": [5, 10, 20, 40],
+  "atr_risk_thresholds_pct": {
+    "low": 1.5,
+    "medium": 2.5,
+    "high": 4.0
+  }
+}
