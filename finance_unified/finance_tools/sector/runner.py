@@ -3,7 +3,7 @@ import csv, json
 from pathlib import Path
 from ..common.data_source import list_sw_indices, fetch_sw_history, fetch_hs300, fetch_security
 from ..common.demo import sector_rows as demo_rows
-from ..common.position_grid import load_grid, apply_grid
+from ..common.position_grid import load_grid
 from .sector_engine import analyze_sector
 from .target_timing import analyze_target
 from .global_assets import fetch_all
@@ -70,7 +70,7 @@ def run(root: Path, demo=False, limit=0):
             if m['code'] in seen:continue
             seen.add(m['code'])
             try:
-                rows=demo_rows(300+len(seen),260,1.0) if demo else fetch_security(m['code'])[0];er=analyze_target(rows,s,rules,settings);er.update({'code':m['code'],'name':m['name'],'asset_type':(m.get('type') or 'ETF').upper(),'sector_name':s['name'],'sector_stage':s['stage']});er=apply_grid(er,grid);er['integrated_target_pct']=min(er['integrated_target_pct'],er['target_position_pct']);target_results.append(er)
+                rows=demo_rows(300+len(seen),260,1.0) if demo else fetch_security(m['code'])[0];er=analyze_target(rows,s,rules,settings,code=m['code'],grid=grid);er.update({'code':m['code'],'name':m['name'],'asset_type':(m.get('type') or 'ETF').upper(),'sector_name':s['name'],'sector_stage':s['stage']});target_results.append(er)
             except Exception as e:errors.append({'scope':m['name'],'error':str(e)})
     if demo:globals_=[]
     else:

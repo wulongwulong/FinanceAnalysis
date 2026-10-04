@@ -37,18 +37,23 @@ def _alert_bits(r: dict, prev: dict | None):
     return bits
 
 
-def run(root: Path, demo=False, mode='report') -> Path:
+def collect(root: Path, demo=False, mode='report', fetcher=None, extra_securities=()):
     rules, etfs, grid = load_config(root); items = []; errors = []; alerts = []
+    known = {e['code'].strip() for e in etfs}
+    for security in extra_securities:
+        if security['code'] not in known:
+            etfs.append(security)
+            known.add(security['code'])
     today = date.today().isoformat(); now = datetime.now()
 
     for i, e in enumerate(etfs):
         code = e['code'].strip(); name = e['name'].strip() or code
         try:
-            rows, source = (demo_rows(10 + i), '离线模拟数据') if demo else fetch_etf_daily(code)
+            rows, source = fetcher(code) if fetcher is not None else (demo_rows(10 + i), '离线模拟数据') if demo else fetch_etf_daily(code)
             current = analyze(rows, rules)
             previous = analyze(rows[:-1], rules) if len(rows) > 81 else None
             r = compare_signal_change(current, previous)
-            r.update({'code': code, 'name': name, 'source': source})
+            r.update({'code': code, 'name': name, 'source': source, 'asset_type': e.get('asset_type', 'ETF')})
             r = apply_grid(r, grid)
             r['is_fresh'] = (r['date'] == today) if not demo else True
             items.append(r)
@@ -67,6 +72,11 @@ def run(root: Path, demo=False, mode='report') -> Path:
         except Exception as ex:
             errors.append({'code': code, 'name': name, 'error': str(ex)}); print(f"ERR {code} {name}: {ex}")
 
+    return items, errors, alerts
+
+
+def run(root: Path, demo=False, mode='report') -> Path:
+    items, errors, alerts = collect(root, demo=demo, mode=mode)
     fresh_count = sum(1 for x in items if x.get('is_fresh'))
     if mode == 'alert':
         if items and fresh_count == 0 and not demo:
@@ -79,7 +89,7 @@ def run(root: Path, demo=False, mode='report') -> Path:
         if alerts and fresh_count > 0 and not demo:
             summary = f'本次触发 {len(alerts)} 只ETF，请查看 latest_alert.txt'
             try:
-                subprocess.run(['/usr/bin/osascript', '-e', f'display notification "{summary}" with title "ETF每日技术监控 V1.0"'], check=False, capture_output=True, text=True)
+                subprocess.run(['/usr/bin/osascript', '-e', f'display notification "{summary}" with title "ETF每日技术监控"'], check=False, capture_output=True, text=True)
             except Exception:
                 pass
     else:
@@ -90,7 +100,7 @@ def run(root: Path, demo=False, mode='report') -> Path:
         if not demo:
             msg = f"日报已生成：{len(items)}只ETF，重要变化{sum(1 for x in items if x.get('is_significant_change'))}只，异常{len(errors)}只"
             try:
-                subprocess.run(['/usr/bin/osascript', '-e', f'display notification "{msg}" with title "ETF每日技术监控 V1.0"'], check=False, capture_output=True, text=True)
+                subprocess.run(['/usr/bin/osascript', '-e', f'display notification "{msg}" with title "ETF每日技术监控"'], check=False, capture_output=True, text=True)
             except Exception:
                 pass
     if not items:

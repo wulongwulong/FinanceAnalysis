@@ -2,14 +2,16 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os, math, time, shutil, re
+import os, math, time, shutil, re, tempfile, csv
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 from io import StringIO
+import html
 
 import numpy as np
 import pandas as pd
+from ..unified import securities_frame, securities_html, securities_markdown
 
 ak = None
 SIGNAL_HORIZONS = (5, 10, 20, 40)
@@ -41,12 +43,12 @@ def configure_paths(root: Path, demo: bool = False):
     global RUN_DT, TODAY, NOW, SCAN_TIME, SCAN_SLOT, RUN_TAG, CACHE_TAG, SW_REALTIME, ak
     ROOT = Path(root).resolve()
     DATA = ROOT / "data" / "fund"
-    REPORTS = ROOT / "outputs" / "fund"
+    REPORTS = ROOT / "outputs" / "analysis"
     DAILY_REPORTS = REPORTS / "01_每日归档"
     ROLLING_REPORTS = REPORTS / "02_滚动汇总"
     LATEST_REPORTS = REPORTS / "03_最新文件"
     LOG_REPORTS = REPORTS / "04_运行日志"
-    CHATGPT_FOLDER = ROOT / "outputs" / "chatgpt" / "fund"
+    CHATGPT_FOLDER = ROOT / "outputs" / "chatgpt"
     CHATGPT_DAILY = CHATGPT_FOLDER / "01_全部扫描记录"
     CHATGPT_SUMMARY = CHATGPT_FOLDER / "02_滚动汇总"
     CHATGPT_LATEST = CHATGPT_FOLDER / "03_最新数据"
@@ -881,11 +883,58 @@ def set_cn_direct():
     v=",".join(parts)
     os.environ["NO_PROXY"]=v; os.environ["no_proxy"]=v
 
+def _quote_date(value):
+    match=re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|\b\d{8}\b",str(value))
+    if not match:return None
+    parsed=pd.to_datetime(match.group(),errors="coerce")
+    return None if pd.isna(parsed) else parsed.strftime("%Y-%m-%d")
+
+def _market_status(d, source, cache_fallback=False, date_confirmed=True):
+    d.attrs.update(source=source, data_date=d["date"].iloc[-1].strftime("%Y-%m-%d"),
+                   cache_fallback=cache_fallback, date_confirmed=bool(date_confirmed))
+    return d
+
+def _read_market_cache(path, label, minimum, require_confirmation=False, current_only=False):
+    suffix=path.name.removeprefix(f"{CACHE_TAG}_")
+    candidates=[path] if current_only else dict.fromkeys([path,*sorted(path.parent.glob(f"*_{suffix}"),reverse=True)])
+    for cached in candidates:
+        if not cached.exists():continue
+        try:
+            d=norm(pd.read_csv(cached))
+            if len(d)<minimum:raise ValueError(f"有效行情不足：{len(d)}")
+            confirmed=not require_confirmation
+            if "_date_confirmed" in d.columns:
+                confirmed=str(d["_date_confirmed"].iloc[-1]).lower() in ("true","1")
+                d=d.drop(columns="_date_confirmed")
+            elif require_confirmation:
+                log(f"{label}旧缓存缺少日期确认标记，仅作未确认历史底稿：{cached.name}")
+            refresh_failed=False
+            if "_cache_fallback" in d.columns:
+                refresh_failed=str(d["_cache_fallback"].iloc[-1]).lower() not in ("false","0")
+                d=d.drop(columns="_cache_fallback")
+            d=_market_status(d,f"缓存 {cached.name}",True,confirmed)
+            d.attrs["history_refresh_failed"]=refresh_failed
+            return d
+        except Exception as e:
+            log(f"{label}缓存读取失败，尝试刷新或其他缓存：{cached.name}: {e}")
+    return pd.DataFrame()
+
+def _atomic_csv(frame, path):
+    path=Path(path)
+    temporary=None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w",encoding="utf-8-sig",dir=path.parent,
+                                         suffix=".tmp",delete=False) as handle:
+            temporary=Path(handle.name)
+            frame.to_csv(handle,index=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary,path)
+    finally:
+        if temporary is not None and temporary.exists():temporary.unlink()
+
 def benchmark():
     f=CACHE/f"{CACHE_TAG}_hs300.csv"
-    if f.exists():
-        d=norm(pd.read_csv(f))
-        if not d.empty: return d
     set_cn_direct()
     # 腾讯优先，新浪兜底；彻底不再调用东方财富
     errors=[]
@@ -896,12 +945,18 @@ def benchmark():
         try:
             d=norm(call_retry(func,label,2))
             if not d.empty:
-                d.tail(400).to_csv(f,index=False)
-                log(f"沪深300基准来源：{label}")
-                return d.tail(400).reset_index(drop=True)
+                d=_market_status(d.tail(400).reset_index(drop=True),label)
+                _atomic_csv(d,f)
+                log(f"沪深300基准来源：{label}，行情日期：{d.attrs['data_date']}")
+                return d
+            raise RuntimeError("返回空行情")
         except Exception as e:
             errors.append(f"{label}: {e}")
-    raise RuntimeError("沪深300两个备用源都失败："+" | ".join(errors))
+    cached=_read_market_cache(f,"沪深300",1)
+    if not cached.empty:
+        log(f"沪深300刷新失败，回退至{cached.attrs['source']}，行情日期：{cached.attrs['data_date']}；"+" | ".join(errors))
+        return cached
+    raise RuntimeError("沪深300两个备用源都失败且无有效缓存："+" | ".join(errors))
 
 def sw_list():
     global SW_REALTIME
@@ -930,6 +985,7 @@ def sw_list():
             close_col=pick_col(["最新价","最新","收盘价","收盘"])
             amount_col=pick_col(["成交额"])
             volume_col=pick_col(["成交量"])
+            date_col=pick_col(["交易日期","行情日期","日期","datetime","date","时间"])
 
             for _,r in df.iterrows():
                 code=str(r[code_col]).split(".")[0].strip()
@@ -937,7 +993,7 @@ def sw_list():
                 if code and name and code!="nan" and name!="nan":
                     rows.append((code,name,level))
 
-                    snap={"date":TODAY}
+                    snap={"date":_quote_date(r[date_col]) if date_col is not None else None}
                     for key,col in [
                         ("open",open_col),("high",high_col),("low",low_col),
                         ("close",close_col),("amount",amount_col),("volume",volume_col)
@@ -975,40 +1031,53 @@ def sw_list():
 
 def sw_hist(code):
     f=CACHE/f"{CACHE_TAG}_sw_{code}.csv"
-    if f.exists():
-        d=norm(pd.read_csv(f))
-        if len(d)>=65:
-            return d
-
-    set_cn_direct()
-    d=norm(call_retry(lambda: ak.index_hist_sw(symbol=code,period="day"),f"申万{code}",2))
-    if d.empty:
-        raise RuntimeError("返回空数据")
+    snap=SW_REALTIME.get(str(code)) if SCAN_SLOT!="盘前" else None
+    quote_date=_quote_date(snap.get("date")) if snap else None
+    dated_snapshot=snap and np.isfinite(snap.get("close",np.nan)) and quote_date is not None and quote_date<=TODAY
+    d=_read_market_cache(f,f"申万{code}",65,require_confirmation=True,current_only=True)
+    cache_fallback=False
+    history_refreshed=False
+    source=d.attrs.get("source","申万历史接口")
+    confirmed=d.attrs.get("date_confirmed",True)
+    if d.empty or d.attrs.get("history_refresh_failed",False) or (SCAN_SLOT!="盘前" and not dated_snapshot):
+        set_cn_direct()
+        try:
+            fresh=norm(call_retry(lambda: ak.index_hist_sw(symbol=code,period="day"),f"申万{code}",2))
+            if len(fresh)<65:raise RuntimeError(f"历史数据不足：{len(fresh)}")
+            d=fresh
+            source="申万历史接口"
+            confirmed=True
+            history_refreshed=True
+        except Exception as e:
+            if d.empty:d=_read_market_cache(f,f"申万{code}",65,require_confirmation=True)
+            if d.empty:raise RuntimeError(f"申万{code}历史刷新失败且无有效缓存：{e}") from e
+            cache_fallback=True
+            source=d.attrs["source"]
+            confirmed=d.attrs["date_confirmed"]
+            log(f"申万{code}历史刷新失败，回退至{source}，行情日期：{d.attrs['data_date']}；{e}")
     d=d.tail(420).reset_index(drop=True)
+    if SCAN_SLOT!="盘前" and not dated_snapshot and not history_refreshed:confirmed=False
 
-    # 午盘/盘中/收盘：用 index_realtime_sw 的当前快照更新/补入今天这一根日K。
-    # 这样三次运行不会只是重复昨天收盘数据。
+    # 复用历史底稿时也应用本次快照；仅使用接口提供的行情日期。
     if SCAN_SLOT != "盘前":
-        snap=SW_REALTIME.get(str(code))
         if snap and np.isfinite(snap.get("close",np.nan)):
-            row={"date":pd.to_datetime(TODAY)}
-            close=float(snap["close"])
-            row["close"]=close
-            for k in ("open","high","low","amount","volume"):
-                v=snap.get(k,np.nan)
-                row[k]=float(v) if np.isfinite(v) else np.nan
-
-            # 若实时接口缺少OHLC，用最新价兜底，确保技术指标可计算
-            for k in ("open","high","low"):
-                if not np.isfinite(row.get(k,np.nan)) or row[k] <= 0:
-                    row[k]=close
-
-            today_dt=pd.to_datetime(TODAY)
-            d=d[d["date"]!=today_dt].copy()
-            d=pd.concat([d,pd.DataFrame([row])],ignore_index=True)
-            d=norm(d).tail(420).reset_index(drop=True)
-
-    d.to_csv(f,index=False)
+            if quote_date is None or quote_date>TODAY:
+                log(f"申万{code}实时价无可确认的来源日期，未覆盖历史行情 {d['date'].iloc[-1]:%Y-%m-%d}。")
+            elif pd.Timestamp(quote_date)>=d["date"].iloc[-1]:
+                row={"date":pd.Timestamp(quote_date),"close":float(snap["close"])}
+                for k in ("open","high","low","amount","volume"):
+                    v=snap.get(k,np.nan)
+                    row[k]=float(v) if np.isfinite(v) else np.nan
+                for k in ("open","high","low"):
+                    if not np.isfinite(row[k]) or row[k]<=0:row[k]=row["close"]
+                d=pd.concat([d[d["date"]!=row["date"]],pd.DataFrame([row])],ignore_index=True)
+                d=norm(d).tail(420).reset_index(drop=True)
+                source=f"申万实时快照 + {source}"
+                confirmed=True
+            else:
+                log(f"申万{code}实时快照日期 {quote_date} 早于历史行情，未覆盖。")
+    d=_market_status(d,source,cache_fallback,confirmed)
+    _atomic_csv(d.assign(_date_confirmed=confirmed,_cache_fallback=cache_fallback),f)
     return d
 
 def set_global_direct():
@@ -1052,16 +1121,18 @@ def fred_series(series_id: str) -> pd.DataFrame:
 def global_cached(key: str, fetcher, label: str) -> pd.DataFrame:
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in key)
     f = CACHE / f"{CACHE_TAG}_global_{safe}.csv"
-    if f.exists():
-        d = norm(pd.read_csv(f))
-        if len(d) >= 65:
-            return d
-    d = norm(call_retry(fetcher, label, 2))
-    if len(d) < 65:
-        raise RuntimeError(f"{label} 历史数据不足：{len(d)}")
-    d = d.tail(420).reset_index(drop=True)
-    d.to_csv(f, index=False)
-    return d
+    try:
+        d = norm(call_retry(fetcher, label, 2))
+        if len(d) < 65:raise RuntimeError(f"{label} 历史数据不足：{len(d)}")
+        d = _market_status(d.tail(420).reset_index(drop=True),label)
+        _atomic_csv(d,f)
+        log(f"{label}刷新成功，行情日期：{d.attrs['data_date']}")
+        return d
+    except Exception as e:
+        cached=_read_market_cache(f,label,65)
+        if cached.empty:raise RuntimeError(f"{label}刷新失败且无有效缓存：{e}") from e
+        log(f"{label}刷新失败，回退至{cached.attrs['source']}，行情日期：{cached.attrs['data_date']}；{e}")
+        return cached
 
 def fetch_with_fallback(name, candidates):
     """
@@ -1380,7 +1451,9 @@ def global_data():
         try:
             df, source = fetch_with_fallback(name, candidates)
             r = analyze(name, df, None, "全球资产")
-            r["数据源"] = source
+            r["数据源"] = df.attrs.get("source", source)
+            r["日期确认"] = df.attrs.get("date_confirmed", True)
+            r["数据状态"] = quote_status(df)
             rows.append(r)
             log(f"全球资产成功：{name} <- {source}")
         except Exception as e:
@@ -1388,12 +1461,43 @@ def global_data():
 
     return pd.DataFrame(rows)
 
+def _validate_records(x, path, required, date_column, price_column=None):
+    missing=[c for c in required if c not in x.columns]
+    if missing:raise RuntimeError(f"历史文件字段校验失败：{path}，缺少 {missing}")
+    if x[list(required)].isna().any().any():
+        raise RuntimeError(f"历史文件字段校验失败：{path}，必要字段为空")
+    if any(x[c].astype(str).str.strip().eq("").any() for c in required):
+        raise RuntimeError(f"历史文件字段校验失败：{path}，必要字段为空字符串")
+    if pd.to_datetime(x[date_column],errors="coerce").isna().any():
+        raise RuntimeError(f"历史文件字段校验失败：{path}，{date_column}无效")
+    if price_column is not None:
+        prices=pd.to_numeric(x[price_column],errors="coerce")
+        if (~np.isfinite(prices) | (prices<=0)).any():
+            raise RuntimeError(f"历史文件字段校验失败：{path}，{price_column}无效")
+
+def _read_history_csv(path, required, date_column, price_column=None):
+    try:
+        with Path(path).open(encoding="utf-8-sig",newline="") as handle:
+            records=csv.reader(handle,strict=True)
+            header=next(records,[])
+            names=[name.strip() for name in header]
+            if not names or any(not name for name in names) or len(set(names))!=len(names):
+                raise ValueError("CSV表头为空或包含重复字段")
+            for line,row in enumerate(records,start=2):
+                if row and len(row)!=len(header):
+                    raise ValueError(f"CSV第{line}条记录字段数与表头不一致")
+        x=pd.read_csv(path)
+        _validate_records(x,path,required,date_column,price_column)
+        return x
+    except Exception as e:
+        raise RuntimeError(f"历史文件读取或校验失败：{path}：{e}") from e
+
 def load_hist():
     if not HISTORY.exists(): return pd.DataFrame()
-    try: return pd.read_csv(HISTORY)
-    except: return pd.DataFrame()
+    return _read_history_csv(HISTORY,("扫描日期","名称","层级","分类"),"扫描日期")
 
 def save_hist(ind):
+    old=load_hist()
     cols=[
         "扫描日期","扫描时间","扫描时段",
         "名称","层级","状态","分类","观察阶段","当前位置",
@@ -1406,9 +1510,8 @@ def save_hist(ind):
     x["扫描日期"]=TODAY
     x["扫描时间"]=SCAN_TIME
     x["扫描时段"]=SCAN_SLOT
-    x=x[cols]
-
-    old=load_hist()
+    x=x[cols+[c for c in x.columns if c not in cols]]
+    _validate_records(x,HISTORY,("扫描日期","名称","层级","分类"),"扫描日期")
     if not old.empty:
         # 兼容旧列（本正式版从零开始，但这里防止CSV结构异常）
         if "扫描时段" not in old.columns:
@@ -1418,15 +1521,15 @@ def save_hist(ind):
 
         # 同一天 + 同一时段 + 同一板块只保留最新一次；
         # 盘前/午盘/收盘互不覆盖。
-        mask=(
-            (old["扫描日期"].astype(str)==TODAY) &
-            (old["扫描时段"].astype(str)==SCAN_SLOT) &
-            old["名称"].astype(str).isin(x["名称"].astype(str))
-        )
+        identities=set(zip(x["名称"].astype(str),x["层级"].astype(str)))
+        mask=((old["扫描日期"].astype(str)==TODAY) &
+              (old["扫描时段"].astype(str)==SCAN_SLOT) &
+              pd.Series([(str(name),str(level)) in identities
+                         for name,level in zip(old["名称"],old["层级"])],index=old.index))
         old=old[~mask]
         x=pd.concat([old,x],ignore_index=True)
 
-    x.to_csv(HISTORY,index=False,encoding="utf-8-sig")
+    _atomic_csv(x,HISTORY)
 
 
 SIGNAL_COLUMNS = [
@@ -1444,24 +1547,25 @@ SIGNAL_COLUMNS = [
 def load_signals():
     if not SIGNALS.exists():
         return pd.DataFrame(columns=SIGNAL_COLUMNS)
-    try:
-        x=pd.read_csv(SIGNALS)
-        for c in SIGNAL_COLUMNS:
-            if c not in x.columns:
-                x[c]=np.nan
-        return x[SIGNAL_COLUMNS]
-    except Exception:
-        return pd.DataFrame(columns=SIGNAL_COLUMNS)
+    x=_read_history_csv(SIGNALS,("信号日期","名称","层级","信号分类","信号价格"),
+                        "信号日期","信号价格")
+    for c in SIGNAL_COLUMNS:
+        if c not in x.columns:x[c]=np.nan
+    return x[SIGNAL_COLUMNS+[c for c in x.columns if c not in SIGNAL_COLUMNS]]
 
 def save_signals(x):
+    old=load_signals()
     if x is None or x.empty:
-        pd.DataFrame(columns=SIGNAL_COLUMNS).to_csv(SIGNALS,index=False,encoding="utf-8-sig")
-        return
-    y=x.copy()
+        y=old.copy()
+    else:
+        _validate_records(x,SIGNALS,("信号日期","名称","层级","信号分类","信号价格"),
+                          "信号日期","信号价格")
+        keys=["信号日期","名称","层级"]
+        y=x.set_index(keys).combine_first(old.set_index(keys)).reset_index()
     for c in SIGNAL_COLUMNS:
         if c not in y.columns:
             y[c]=np.nan
-    y[SIGNAL_COLUMNS].to_csv(SIGNALS,index=False,encoding="utf-8-sig")
+    _atomic_csv(y[SIGNAL_COLUMNS+[c for c in y.columns if c not in SIGNAL_COLUMNS]],SIGNALS)
 
 def benchmark_value_on(bm, date_value):
     if bm is None or bm.empty:
@@ -1517,7 +1621,11 @@ def register_new_a1_signals(ind, old_hist, hist_map, bm):
         if df is None or df.empty:
             continue
 
-        signal_date=str(r.get("最新日期",TODAY))
+        signal_date=_quote_date(r.get("最新日期"))
+        history_date=_quote_date(df["date"].iloc[-1])
+        if signal_date!=TODAY or history_date!=TODAY or not df.attrs.get("date_confirmed",True):
+            log(f"跳过 {name} 当日A1登记：行情日期 {signal_date or history_date or '未知'}，未取得当日确认行情。")
+            continue
         signal_price=float(r.get("最新值",df["close"].iloc[-1]))
 
         # 同一个交易日、同一个行业，只记录一次
@@ -1744,7 +1852,57 @@ def compact_rows(df, limit=15):
         x["决策优先分"]=x.apply(decision_priority,axis=1)
     return x.sort_values(["决策优先分","机会分"],ascending=[False,False]).head(limit).to_dict("records")
 
-def decision_pack_markdown(ind, glob, signals, stats, history):
+def quote_status(df):
+    status=[]
+    if df.attrs.get("cache_fallback"):
+        status.append("缓存回退")
+    if not df.attrs.get("date_confirmed", True):
+        status.append("日期未确认")
+    return "、".join(status) or "日期已确认"
+
+
+def quote_date_range(df):
+    dates=sorted(set(df.get("最新日期",pd.Series(dtype=str)).dropna().astype(str)))
+    return "" if not dates else dates[0] if len(dates)==1 else f"{dates[0]} 至 {dates[-1]}"
+
+
+def quote_summary(df):
+    date_text=quote_date_range(df) or "未提供"
+    states=df.get("数据状态",pd.Series(dtype=str)).fillna("").astype(str)
+    return f"行情截至：{date_text}；缓存回退 {states.str.contains('缓存回退').sum()} 项；日期未确认 {states.str.contains('日期未确认').sum()} 项"
+
+
+TARGET_COLUMNS={
+    "industry_name":"行业", "industry_code":"行业代码", "opportunity_type":"机会类型", "industry_classification":"行业分类",
+    "industry_date":"行业行情日期", "industry_position":"行业位置", "industry_advice":"行业建议",
+    "code":"标的代码", "name":"标的名称", "asset_type":"类型", "date":"标的行情日期",
+    "source":"标的数据源", "strategy_name":"技术策略", "action_signal":"技术动作",
+    "weak_turn_state":"弱转强", "daily_text":"日线", "weekly_text":"周线",
+    "status":"数据状态", "participation_condition":"技术条件", "analysis":"技术依据", "error":"异常说明",
+}
+
+
+def target_frame(targets):
+    return pd.DataFrame(targets or [],columns=TARGET_COLUMNS).rename(columns=TARGET_COLUMNS)
+
+
+def targets_markdown(targets):
+    lines=["映射来自已配置标的池；逐行业保留关联，技术条件采用“日线打分、周线加权”。结合行业位置与失效区研究。", ""]
+    if not targets:
+        return "\n".join(lines+["暂无机会对应标的。"])
+    for row in targets:
+        lines += [
+            f"- {row['industry_name']}｜{row['opportunity_type']}｜{row['industry_classification']}｜行业行情 {row['industry_date'] or '未确认'}｜行业位置 {row['industry_position']}",
+            f"  - 标的：{row['code'] or '—'} {row['name'] or '—'}｜{row['asset_type'] or '—'}；行情 {row['date'] or '未确认'}；来源 {row['source'] or '—'}；{row['status']}",
+            f"  - {row['strategy_name']}｜技术动作 {row['action_signal'] or '—'}｜弱转强 {row['weak_turn_state'] or '—'}｜日线 {row['daily_text'] or '—'}｜周线 {row['weekly_text'] or '—'}",
+            f"  - {row['participation_condition']}；行业建议：{row['industry_advice']}",
+        ]
+        if row['error']:
+            lines.append(f"  - 异常说明：{row['error']}")
+    return "\n".join(lines)
+
+
+def decision_pack_markdown(ind, glob, signals, stats, history, targets=None, monitor=None):
     """
     单日完整决策包：
     用户可以直接把多个日期的这个文件上传给 ChatGPT 做跨日比较。
@@ -1756,28 +1914,35 @@ def decision_pack_markdown(ind, glob, signals, stats, history):
     a2=ind[ind["分类"].astype(str).str.startswith("A2")].copy()
     a3=ind[ind["分类"].astype(str).str.startswith("A3")].copy()
     b=ind[ind["分类"].astype(str).str.startswith("B")].copy()
+    low_turn=ind[ind["分类"].astype(str).str.startswith(("A1","A2"))]
+    trend=ind[ind["分类"].astype(str).str.startswith("C")]
 
     env=global_environment_summary(glob)
     ga=enrich_global_analysis(glob)
 
     out=[]
     out += [
-        "# ChatGPT 投资决策数据包",
+        "# Finance 分析 · 决策数据包",
         "",
-        f"数据日期：{TODAY}",
+        f"扫描日期：{TODAY}",
         f"扫描时段：{SCAN_SLOT}",
         f"扫描时间：{SCAN_TIME}",
         f"生成时间：{NOW}",
+        "行业"+quote_summary(ind),
+        "全球资产"+quote_summary(glob),
         "",
         "## 一、使用说明",
         "",
         "这是本地量化扫描结果，不是投资建议。请将本文件与前几天同类文件一起交给 ChatGPT，",
         "让 ChatGPT 比较板块信号迁移、技术指标变化、全球环境变化，并联网核实最新行业催化和基金信息。",
+        "行业多周期策略：低位转强为 A1/A2，趋势延续为 C。",
+        "两类候选分别研究，不设跨类型优先顺序；候选不代表实际买卖动作。",
         "",
         "重点不是只看某一天分数，而是比较盘前 / 午盘 / 收盘以及跨日变化：",
         "- B → A1 / A2 的升级",
         "- A1 是否连续确认",
         "- A1 → A3 是否已经加速",
+        "- C 趋势延续是否保持强势、回踩后是否恢复",
         "- MACD / KDJ / BOLL 是否继续共振",
         "- 当前是否回到理想区 / 合理区",
         "- 信号是否触及失效条件",
@@ -1787,34 +1952,43 @@ def decision_pack_markdown(ind, glob, signals, stats, history):
         f"- 成功扫描行业：{len(ind)}",
         f"- A1 低位刚转强：{len(a1)}",
         f"- A2 低位转强：{len(a2)}",
+        f"- 低位转强机会（A1/A2）：{len(low_turn)}",
+        f"- 趋势延续机会（C）：{len(trend)}",
         f"- A3 已加速：{len(a3)}",
         f"- B 低位等待：{len(b)}",
         f"- 全球资产：{len(glob)}",
         "",
-        "## 三、今日优先候选",
+        "## 三、今日新机会",
         ""
     ]
 
-    top=ind.sort_values(["决策优先分","机会分"],ascending=[False,False]).head(15)
-    for i,(_,r) in enumerate(top.iterrows(),1):
-        out += [
-            f"### {i}. {r['名称']}（{r['层级']}）",
-            f"- 分类：{r['分类']}；观察阶段：{r['观察阶段']}；状态：{r['状态']}",
-            f"- 机会分：{r['机会分']}；择时确认：{r['择时确认分']}/20；风险分：{r['风险分']}；决策优先分：{r['决策优先分']}",
-            f"- 七周期位置：15天 {r['15天']}%；1月 {r['1个月']}%；2月 {r['2个月']}%；3月 {r['3个月']}%；4月 {r['4个月']}%；5月 {r['5个月']}%；6月 {r['6个月']}%",
-            f"- 相对沪深300：15日 {fmt(r['15日相对沪深300'],2)}%；1月 {fmt(r['1月相对沪深300'],2)}%",
-            f"- MACD：{r['MACD信号']} / {r['MACD柱']}",
-            f"- KDJ：{r['KDJ信号']}（K {fmt(r['K值'],1)} / D {fmt(r['D值'],1)} / J {fmt(r['J值'],1)}）",
-            f"- BOLL：{r['BOLL信号']} / {r['BOLL状态']}；距中轨 {fmt(r['距BOLL中轨%'],2)}%",
-            f"- RSI14：{r['RSI14']}；成交额5日/20日：{fmt(r['5日成交额/20日均值'],2)}",
-            f"- 当前位置：{r['当前位置']}",
-            f"- 理想观察区：{r['理想观察区']}",
-            f"- 信号失效区：{r['信号失效区']}",
-            f"- 当前规则建议：{r['最终建议']}",
-            ""
-        ]
+    for title,candidates in (("低位转强（A1/A2）",low_turn),("趋势延续（C）",trend)):
+        out += [f"### {title}", "", "组内沿用原决策优先分与机会分排序，展示前15项。", ""]
+        if candidates.empty:
+            out += ["暂无候选。", ""]
+        top=candidates.sort_values(["决策优先分","机会分"],ascending=[False,False]).head(15)
+        for i,(_,r) in enumerate(top.iterrows(),1):
+            out += [
+                f"#### {i}. {r['名称']}（{r['层级']}）",
+                f"- 行情日期：{r['最新日期']}；来源：{r.get('数据源','未提供')}；{r.get('数据状态','未提供')}",
+                f"- 分类：{r['分类']}；观察阶段：{r['观察阶段']}；状态：{r['状态']}",
+                f"- 机会分：{r['机会分']}；择时确认：{r['择时确认分']}/20；风险分：{r['风险分']}；决策优先分：{r['决策优先分']}",
+                f"- 七周期位置：15天 {r['15天']}%；1月 {r['1个月']}%；2月 {r['2个月']}%；3月 {r['3个月']}%；4月 {r['4个月']}%；5月 {r['5个月']}%；6月 {r['6个月']}%",
+                f"- 相对沪深300：15日 {fmt(r['15日相对沪深300'],2)}%；1月 {fmt(r['1月相对沪深300'],2)}%",
+                f"- MACD：{r['MACD信号']} / {r['MACD柱']}",
+                f"- KDJ：{r['KDJ信号']}（K {fmt(r['K值'],1)} / D {fmt(r['D值'],1)} / J {fmt(r['J值'],1)}）",
+                f"- BOLL：{r['BOLL信号']} / {r['BOLL状态']}；距中轨 {fmt(r['距BOLL中轨%'],2)}%",
+                f"- RSI14：{r['RSI14']}；成交额5日/20日：{fmt(r['5日成交额/20日均值'],2)}",
+                f"- 当前位置：{r['当前位置']}",
+                f"- 理想观察区：{r['理想观察区']}",
+                f"- 信号失效区：{r['信号失效区']}",
+                f"- 当前规则建议：{r['最终建议']}",
+                ""
+            ]
 
     out += [
+        "### 机会对应标的", "", targets_markdown(targets), "",
+        securities_markdown(targets,monitor) if monitor is not None else "",
         "## 四、A1 / A2 / A3 分类清单",
         "",
         "### A1 低位刚转强 ★★★★★",
@@ -1895,11 +2069,11 @@ def decision_pack_markdown(ind, glob, signals, stats, history):
         "请完成以下任务：",
         "",
         "1. 找出最近几天真正持续改善的板块，而不是只看今天分数最高的板块。",
-        "2. 重点识别 B→A1、A1持续确认、A1→A2，以及A3加速后的回踩机会。",
+        "2. 分别研究低位转强（A1/A2）与趋势延续（C）：前者看 B→A1、A1持续确认、A1→A2，后者看趋势持续与回踩确认；A3保留为加速后回踩观察。",
         "3. 判断 MACD、KDJ、BOLL、RSI、量能、相对沪深300是否形成持续共振。",
         "4. 结合黄金、原油、美股、SOX、美元、美债、VIX判断外部环境是否支持该板块。",
         "5. 联网搜索最新行业政策、产业催化、商品价格、海外联动和主要风险。",
-        "6. 最终只保留 3~5 个最值得研究的板块，并说明为什么其他候选被淘汰。",
+        "6. 最终只保留 3~5 个最值得研究的板块，注明机会类型与行业多周期策略来源，并说明为什么其他候选被淘汰；不机械排除C，也不凑齐两类数量。",
         "7. 对每个最终板块，联网筛选当前可交易基金：",
         "   - 场内 ETF：优先跟踪指数纯度高、规模较大、成交活跃、价差较小、费率合理的产品，给 1~3 只。",
         "   - 场外基金：优先 ETF 联接 / 指数基金，其次才考虑主动行业基金，给 1~3 只。",
@@ -1915,6 +2089,7 @@ def decision_pack_markdown(ind, glob, signals, stats, history):
         "",
         "### 最终候选 1",
         "- 板块：",
+        "- 机会类型与策略来源：",
         "- 综合评级：S/A/B/C",
         "- 最近几天信号变化：",
         "- 当前阶段：",
@@ -1927,7 +2102,7 @@ def decision_pack_markdown(ind, glob, signals, stats, history):
         "- 主要风险：",
         "",
         "最后再给一个总表：",
-        "板块｜评级｜场内首选｜场外首选｜当前动作｜理想位置｜主要风险",
+        "板块｜机会类型｜策略来源｜评级｜场内首选｜场外首选｜参与条件｜理想位置｜主要风险",
         ""
     ]
     return "\n".join(out)
@@ -2034,23 +2209,33 @@ def build_rolling_summary(history, days=7):
     ]
     return "\n".join(out)
 
-def make_md(ind,glob,signals,stats):
+def make_md(ind,glob,signals,stats,targets=None,monitor=None):
     top=ind.head(12)
     a1=ind[ind["分类"].str.startswith("A1")].head(10)
     a2=ind[ind["分类"].str.startswith("A2")].head(10)
     a3=ind[ind["分类"].str.startswith("A3")].head(10)
+    b=ind[ind["分类"].str.startswith("B")]
+    low_turn=ind[ind["分类"].str.startswith(("A1","A2"))]
+    trend=ind[ind["分类"].str.startswith("C")]
     out=[
-        "# 给 ChatGPT 的板块分析数据","",f"扫描时间：{NOW}","",
+        "# Finance 分析 · 研究摘要","",f"扫描时间：{NOW}","",
+        "行业"+quote_summary(ind), "全球资产"+quote_summary(glob), "",
         "请联网研究以下量化候选的最新行业新闻、政策、产业催化、海外联动与风险。",
-        "重点判断哪些属于真正的低位转强，哪些可能只是技术性反弹；关注未来 2～8 周催化持续性。",
+        "行业多周期策略：低位转强为 A1/A2，趋势延续为 C。",
+        "分别研究低位转强与趋势延续，不设跨类型优先顺序；关注未来 2～8 周催化持续性、当前位置与失效条件。",
+        "候选不代表实际买卖动作。",
         "量化分数不是上涨概率，不要直接据此给出确定性买入结论。","",
-        "## A1：低位刚转强 ★★★★★"
+        f"- 低位转强机会（A1/A2）：{len(low_turn)}",
+        f"- 趋势延续机会（C）：{len(trend)}","",
+        "## 低位转强（A1/A2）","",
+        "### A1：低位刚转强 ★★★★★"
     ]
     if a1.empty:
         out.append("暂无 A1 信号。")
     for _,r in a1.iterrows():
         out += [
-            f"### {r['名称']}（{r['层级']}）",
+            f"#### {r['名称']}（{r['层级']}）",
+            f"- 行情日期：{r['最新日期']}；来源：{r.get('数据源','未提供')}；{r.get('数据状态','未提供')}",
             f"- 状态 {r['状态']}；机会 {r['机会分']}；风险 {r['风险分']}；信号年龄 {r['信号年龄']}天",
             f"- 位置：15天 {r['15天']}%，1月 {r['1个月']}%，2月 {r['2个月']}%，3月 {r['3个月']}%，4月 {r['4个月']}%，5月 {r['5个月']}%，6月 {r['6个月']}%",
             f"- 相对沪深300：15日 {fmt(r['15日相对沪深300'],2)}%，1月 {fmt(r['1月相对沪深300'],2)}%",
@@ -2059,12 +2244,13 @@ def make_md(ind,glob,signals,stats):
             f"- 生命周期：{r['生命周期']}；当前位置：{r['当前位置']}；理想观察区：{r['理想观察区']}；失效区：{r['信号失效区']}",
             f"- 最终建议：{r['最终建议']}",""
         ]
-    out += ["", "## A2：低位转强 ★★★★", ""]
+    out += ["", "### A2：低位转强 ★★★★", ""]
     if a2.empty:
         out.append("暂无 A2 信号。")
     for _,r in a2.iterrows():
         out += [
-            f"### {r['名称']}（{r['层级']}）",
+            f"#### {r['名称']}（{r['层级']}）",
+            f"- 行情日期：{r['最新日期']}；来源：{r.get('数据源','未提供')}；{r.get('数据状态','未提供')}",
             f"- 状态 {r['状态']}；机会 {r['机会分']}；风险 {r['风险分']}；信号年龄 {r['信号年龄']}天",
             f"- 位置：15天 {r['15天']}%，1月 {r['1个月']}%，2月 {r['2个月']}%，3月 {r['3个月']}%，4月 {r['4个月']}%，5月 {r['5个月']}%，6月 {r['6个月']}%",
             f"- 相对沪深300：15日 {fmt(r['15日相对沪深300'],2)}%，1月 {fmt(r['1月相对沪深300'],2)}%",
@@ -2074,12 +2260,24 @@ def make_md(ind,glob,signals,stats):
             f"- 最终建议：{r['最终建议']}",""
         ]
 
-    out += ["", "## A3：低位启动后已加速 ★★★", ""]
+    out += ["", "## 趋势延续（C）", "", "沿用行业多周期策略的 C 趋势机会，按原组内顺序展示前12项。", ""]
+    if trend.empty:
+        out.append("暂无候选。")
+    for _,r in trend.head(12).iterrows():
+        out += [
+            f"### {r['名称']}（{r['层级']}）",
+            f"- 行情日期：{r['最新日期']}；来源：{r.get('数据源','未提供')}；{r.get('数据状态','未提供')}",
+            f"- 分类 {r['分类']}；状态 {r['状态']}；机会 {r['机会分']}；风险 {r['风险分']}；择时确认 {r['择时确认分']}/20",
+            f"- 当前位置：{r['当前位置']}；理想观察区：{r['理想观察区']}；失效区：{r['信号失效区']}",
+            f"- 当前规则建议：{r['最终建议']}", ""
+        ]
+
+    out += ["", "## 后续观察", "", "### A3：低位启动后已加速 ★★★", ""]
     if a3.empty:
         out.append("暂无 A3 信号。")
     for _,r in a3.iterrows():
         out += [
-            f"### {r['名称']}（{r['层级']}）",
+            f"#### {r['名称']}（{r['层级']}）",
             f"- 状态 {r['状态']}；机会 {r['机会分']}；风险 {r['风险分']}；信号年龄 {r['信号年龄']}天",
             f"- 位置：15天 {r['15天']}%，1月 {r['1个月']}%，2月 {r['2个月']}%，3月 {r['3个月']}%，4月 {r['4个月']}%，5月 {r['5个月']}%，6月 {r['6个月']}%",
             f"- 相对沪深300：15日 {fmt(r['15日相对沪深300'],2)}%，1月 {fmt(r['1月相对沪深300'],2)}%",
@@ -2087,6 +2285,15 @@ def make_md(ind,glob,signals,stats):
             "- 提示：该板块中长期位置仍不高，但短周期已经明显加速，优先等待回踩而不是追高。",""
         ]
 
+    out += ["", "### B：低位等待", ""]
+    if b.empty:
+        out.append("暂无。")
+    for _,r in b.head(10).iterrows():
+        out.append(f"- {r['名称']}｜状态 {r['状态']}｜择时 {r['择时确认分']}/20｜{r['当前位置']}｜{r['最终建议']}")
+
+    out += ["", "## 机会对应标的", "", targets_markdown(targets), ""]
+    if monitor is not None:
+        out += [securities_markdown(targets,monitor), ""]
     out += ["", "## A1 历史信号验证", ""]
     out.append(f"- 已登记 A1 信号：{0 if signals is None else len(signals)} 条")
     for _h in SIGNAL_HORIZONS:
@@ -2101,7 +2308,7 @@ def make_md(ind,glob,signals,stats):
                 f"+20日 {fmt(_s['20日收益%'],2)}%｜+40日 {fmt(_s['40日收益%'],2)}%｜"
                 f"当前最大回撤 {fmt(_s['当前最大回撤%'],2)}%"
             )
-    out += ["", "说明：历史验证从 V1.0 开始按实际扫描信号持续积累；样本很少时不要据此判断策略有效。", ""]
+    out += ["", "说明：历史验证按实际扫描信号持续积累；样本很少时不要据此判断策略有效。", ""]
 
     out += ["## TOP12",""]
     for i,(_,r) in enumerate(top.iterrows(),1):
@@ -2133,7 +2340,7 @@ def table_rows(df,cols):
     if df is None or df.empty:
         return '<tr><td colspan="%d">暂无数据</td></tr>' % max(1,len(cols))
     rows=[]
-    wrap_cols={"BOLL状态","BOLL信号","MACD信号","KDJ信号","观察阶段","理想观察区","信号失效区"}
+    wrap_cols={"BOLL状态","BOLL信号","MACD信号","KDJ信号","观察阶段","理想观察区","信号失效区","技术条件","技术依据","日线","周线","异常说明","行业建议","行业关联","机会条件","技术判断","判断差异","每日变化","数据状态"}
     advice_cols={"最终建议"}
     for _,r in df.iterrows():
         cells=[]
@@ -2148,27 +2355,30 @@ def table_rows(df,cols):
                 cls=' class="advice"'
             elif c in wrap_cols:
                 cls=' class="wrap"'
-            cells.append(f"<td{cls}>{v}</td>")
+            cells.append(f"<td{cls}>{html.escape(str(v))}</td>")
         rows.append("<tr>"+"".join(cells)+"</tr>")
     return "\n".join(rows)
 
-def make_html(ind,glob,source_errors,failures,signals,stats):
-    top=ind.head(12)
+def make_html(ind,glob,source_errors,failures,signals,stats,targets=None,monitor=None):
     a1=ind[ind["分类"].str.startswith("A1")]
     a2=ind[ind["分类"].str.startswith("A2")]
     a3=ind[ind["分类"].str.startswith("A3")]
     b=ind[ind["分类"].str.startswith("B")]
     c=ind[ind["分类"].str.startswith("C")]
     d=ind[ind["分类"].str.startswith("D")]
-    cols=["名称","层级","分类","观察阶段","机会分","风险分","MACD信号","KDJ信号","BOLL信号","择时确认分","当前位置","最终建议"]
+    low_turn=ind[ind["分类"].str.startswith(("A1","A2"))]
+    cols=["名称","层级","分类","观察阶段","机会分","风险分","MACD信号","KDJ信号","BOLL信号","择时确认分","当前位置","理想观察区","信号失效区","最终建议"]
     pcols=["名称","层级","15天","1个月","2个月","3个月","4个月","5个月","6个月","状态","分类","观察阶段","机会分","风险分","MACD信号","KDJ信号","BOLL信号","择时确认分","当前位置","理想观察区","信号失效区","最终建议"]
-    gcols=["名称","数据源","15天","1个月","3个月","6个月","状态","机会分","风险分"]
+    cols=["名称","分类","机会分","风险分","当前位置","最终建议","最新日期"]
+    pcols += ["最新日期","数据源","数据状态"]
+    gcols=["名称","最新日期","数据源","数据状态","15天","1个月","3个月","6个月","状态","机会分","风险分"]
     scols=["信号日期","名称","层级","验证状态","观察交易日","5日收益%","5日超额%","10日收益%","10日超额%","20日收益%","20日超额%","40日收益%","40日超额%","当前最大回撤%"]
     def names(x): return "、".join(x["名称"].head(20).tolist()) if not x.empty else "暂无"
     warnings=[]
     if source_errors: warnings += source_errors
     if failures: warnings.append(f"有 {len(failures)} 个行业历史行情失败，报告按成功数据生成。")
-    warn_html="<br>".join(warnings) if warnings else "数据源运行正常。"
+    warn_html="<br>".join(html.escape(str(w)) for w in warnings) if warnings else "行情日期及回退状态见各表。"
+    target_data=target_frame(targets)
 
     stat_cards=[]
     if stats is not None and not stats.empty:
@@ -2194,7 +2404,8 @@ def make_html(ind,glob,source_errors,failures,signals,stats):
     gacols=["名称","机会判断","状态","15天","1个月","3个月","6个月","解读","A股映射"]
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>基金投资板块分析 {TODAY} {SCAN_SLOT}</title>
+<meta name="market-data-date" content="{html.escape(quote_date_range(ind))}">
+<title>Finance 分析 {TODAY} {SCAN_SLOT}</title>
 <style>
 body{{margin:0;background:#f5f6f8;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;color:#17191f}}
 .wrap{{max-width:1400px;margin:auto;padding:26px}}h1{{margin:0}}.sub{{color:#757b87;margin:6px 0 20px}}
@@ -2211,20 +2422,30 @@ section::-webkit-scrollbar{{height:10px}}
 section::-webkit-scrollbar-thumb{{background:#cfd3da;border-radius:999px}}
 section::-webkit-scrollbar-track{{background:#f3f4f6;border-radius:999px}}
 .grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}.pool{{border:1px solid #eceef2;border-radius:10px;padding:13px;line-height:1.7}}
-.note{{background:#f8f9fb;border-radius:10px;padding:12px;line-height:1.6;color:#4c525e}}.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:12px 0}}footer{{color:#777;font-size:12px;line-height:1.7;margin:22px 0}}
+.note{{background:#f8f9fb;border-radius:10px;padding:12px;line-height:1.6;color:#4c525e}}.stats{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:12px 0}}footer{{color:#777;font-size:12px;line-height:1.7;margin:22px 0}}nav{{display:flex;gap:18px;flex-wrap:wrap;padding:14px 0}}nav a{{color:#245fca;text-decoration:none}}summary{{cursor:pointer;padding:12px;font-weight:600}}
 @media(max-width:800px){{.cards,.grid,.stats{{grid-template-columns:1fr 1fr}}.wrap{{padding:12px}}}}
 </style></head><body><div class="wrap">
-<h1>基金投资板块分析 V1.0</h1><div class="sub">{NOW} ｜ <b>{SCAN_SLOT}</b> ｜ A股：申万行业｜全球：新浪/FRED/ETF兜底</div>
+<h1>Finance 分析</h1><div class="sub">{NOW} ｜ <b>{SCAN_SLOT}</b> ｜ A股：申万行业｜全球：新浪/FRED/ETF兜底</div>
+<nav><a href="#low-turn">低位转强</a><a href="#trend">趋势延续</a><a href="#holdings">实际持仓</a><a href="#securities">标的与监控</a><a href="#global">全球环境</a><a href="#history">历史验证</a></nav>
+<div class="note">扫描时间与行情日期分别记录。行业{quote_summary(ind)}。<br>全球资产{quote_summary(glob)}。</div>
 <div class="cards">
 <div class="card"><div class="k">成功扫描行业</div><div class="v">{len(ind)}</div></div>
-<div class="card"><div class="k">A1 刚转强</div><div class="v">{len(a1)}</div></div>
-<div class="card"><div class="k">A2 转强</div><div class="v">{len(a2)}</div></div>
+<div class="card"><div class="k">低位转强 A1/A2</div><div class="v">{len(low_turn)}</div></div>
+<div class="card"><div class="k">趋势延续 C</div><div class="v">{len(c)}</div></div>
 <div class="card"><div class="k">A3 已加速</div><div class="v">{len(a3)}</div></div>
 <div class="card"><div class="k">全球资产数</div><div class="v">{len(glob)}</div></div>
 </div>
-<section><h2>V1.0 使用方式</h2>
+<section><h2>今日新机会 · 行业多周期策略</h2><div class="note">低位转强为 A1/A2，趋势延续为 C。两类分别展示，不设跨类型优先顺序。候选不代表实际买卖动作。</div></section>
+<section id="low-turn"><h2>低位转强（A1/A2）</h2><div class="note">按原组内顺序展示前12项，关注转强确认、当前位置与失效条件。</div><table><thead><tr>{''.join(f'<th>{x}</th>' for x in cols)}</tr></thead><tbody>{table_rows(low_turn.head(12),cols)}</tbody></table></section>
+<section id="trend"><h2>趋势延续（C）</h2><div class="note">沿用行业多周期策略的 C 趋势机会，按原组内顺序展示前12项；独立于低位候选数量，结合当前位置与回踩条件研究。</div><table><thead><tr>{''.join(f'<th>{x}</th>' for x in cols)}</tr></thead><tbody>{table_rows(c.head(12),cols)}</tbody></table></section>
+{securities_html(targets,monitor)}
+<details><summary>机会对应标的 · 行业关联明细</summary>
+<section id="opportunity-targets"><h2>机会对应标的</h2><div class="note">映射来自已配置标的池，保留每个行业的关联。标的技术条件采用“日线打分、周线加权”；结合行业位置与失效区研究。</div><table><thead><tr>{''.join(f'<th>{x}</th>' for x in target_data.columns)}</tr></thead><tbody>{table_rows(target_data,list(target_data.columns))}</tbody></table></section>
+</details>
+<details><summary>阅读说明与分类依据</summary>
+<section><h2>报告与留档</h2>
 <div class="note">
-每天运行后，<b>基金报告</b> 文件夹会自动分类保存全部结果：<br>
+每天运行后，<b>分析报告</b> 文件夹会自动分类保存全部结果：<br>
 <b>01_每日归档/日期_盘前/午盘/收盘_ChatGPT决策包.md</b>：每个时段独立留档；<br>
 <b>02_滚动汇总/最近7日_决策汇总.md</b>：最近7个扫描日的板块迁移；<br>
 <b>02_滚动汇总/最近20日_决策汇总.md</b>：中期迁移汇总；<br><b>03_最新文件/最新_ChatGPT决策包.md</b>：始终保留最新一天。<br><br>
@@ -2237,7 +2458,6 @@ section::-webkit-scrollbar-track{{background:#f3f4f6;border-radius:999px}}
 <b>当前位置：</b>理想区 / 合理区 / 偏高 / 过热 / 信号失效。理想观察区由 MA20、BOLL中轨和 ATR14 动态计算，不使用固定“-5%”规则。<br>
 <b>原则：</b>A1/A2负责判断“值不值得看”，MACD/KDJ/BOLL负责判断“现在是不是更合适的时点”。A3默认不追高。
 </div></section>
-<section><h2>今日机会 TOP12</h2><div class="note">首页只展示决策核心字段；详细七周期位置、观察区和失效区请看下方“七周期位置”。</div><table><thead><tr>{''.join(f'<th>{x}</th>' for x in cols)}</tr></thead><tbody>{table_rows(top,cols)}</tbody></table></section>
 <section><h2>机会分类</h2><div class="grid">
 <div class="pool"><b>🟢 A1 低位刚转强 ★★★★★</b><br><span style="color:#666">优先研究</span><br>{names(a1)}</div>
 <div class="pool"><b>🟢 A2 低位转强 ★★★★</b><br><span style="color:#666">重点观察</span><br>{names(a2)}</div>
@@ -2246,20 +2466,8 @@ section::-webkit-scrollbar-track{{background:#f3f4f6;border-radius:999px}}
 <div class="pool"><b>🔵 C 趋势机会</b><br>{names(c)}</div>
 <div class="pool"><b>🔴 D 高位</b><br>{names(d)}</div>
 </div></section>
-<section><h2>A1 历史信号验证</h2>
-<div class="note">
-已登记 A1 信号 <b>{signal_count}</b> 条。+5 / +10 / +20 / +40 均按<b>交易日</b>计算；
-超额收益 = 行业收益 - 同期沪深300收益。<br>
-第一天不会凭空生成未来收益，后续每天运行会自动回填。
-<b>样本数很少时不要据此判断策略是否有效。</b>
-</div>
-<div class="stats">{''.join(stat_cards)}</div>
-<table><thead><tr>{''.join(f'<th>{x}</th>' for x in scols)}</tr></thead>
-<tbody>{table_rows(recent_signals,scols)}</tbody></table>
-</section>
-<section><h2>七周期位置</h2><div class="note">此表字段较多，可在表格区域内左右滑动；第一列名称会固定，不会再溢出卡片。</div><div class="note">0% 接近周期低点，100% 接近周期高点。重点看“6个月位置仍低，但15天/1个月明显抬升”。MACD/KDJ用于择时确认，不单独决定A1/A2/A3分类。</div>
-<table><thead><tr>{''.join(f'<th>{x}</th>' for x in pcols)}</tr></thead><tbody>{table_rows(ind,pcols)}</tbody></table></section>
-<section><h2>全球资产机会分析</h2>
+</details>
+<section id="global"><h2>全球资产机会分析</h2>
 <div class="note">
 <b>全球环境总览：</b>{env['总览']}<br>
 <b>能源：</b>{env['能源']} ｜ 
@@ -2271,10 +2479,27 @@ section::-webkit-scrollbar-track{{background:#f3f4f6;border-radius:999px}}
 <table><thead><tr>{''.join(f'<th>{x}</th>' for x in gacols)}</tr></thead>
 <tbody>{table_rows(global_analysis,gacols)}</tbody></table>
 </section>
+<details><summary>全球资产原始量化数据</summary>
 <section><h2>黄金 / 原油 / 美股 / 美元 / 美债 / VIX 原始量化数据</h2>
 <table><thead><tr>{''.join(f'<th>{x}</th>' for x in gcols)}</tr></thead><tbody>{table_rows(glob,gcols)}</tbody></table></section>
+</details>
+<section id="history"><h2>A1 历史信号验证</h2>
+<div class="note">
+已登记 A1 信号 <b>{signal_count}</b> 条。+5 / +10 / +20 / +40 均按<b>交易日</b>计算；
+超额收益 = 行业收益 - 同期沪深300收益。<br>
+第一天不会凭空生成未来收益，后续每天运行会自动回填。
+<b>样本数很少时不要据此判断策略是否有效。</b>
+</div>
+<div class="stats">{''.join(stat_cards)}</div>
+<table><thead><tr>{''.join(f'<th>{x}</th>' for x in scols)}</tr></thead>
+<tbody>{table_rows(recent_signals,scols)}</tbody></table>
+</section>
+<details><summary>全部行业与七周期位置</summary>
+<section><h2>七周期位置</h2><div class="note">此表字段较多，可在表格区域内左右滑动；第一列名称会固定，不会再溢出卡片。</div><div class="note">0% 接近周期低点，100% 接近周期高点。重点看“6个月位置仍低，但15天/1个月明显抬升”。MACD/KDJ用于择时确认，不单独决定A1/A2/A3分类。</div>
+<table><thead><tr>{''.join(f'<th>{x}</th>' for x in pcols)}</tr></thead><tbody>{table_rows(ind,pcols)}</tbody></table></section>
+</details>
 <section><h2>数据源状态</h2><div class="note">{warn_html}</div></section>
-<footer><b>说明：</b>这是研究筛选工具，不构成投资建议；机会分不是上涨概率。V1.0 已加入全球资产机会分析；V1.0 已加入 A1 信号 +5/+10/+20/+40 日收益、超额收益和最大回撤跟踪；A类已拆分为 A1/A2/A3；A股采用申万行业，沪深300优先腾讯、备用新浪；全球资产优先新浪/FRED，必要时使用 ETF 代理。美元项使用 FRED 广义美元指数，并非 ICE DXY。Russell2000 / SOX / VIX 在原指数源不可用时可分别使用 IWM / SOXX / VIXY ETF 作为代理。公开接口可能存在延迟或临时不可用。</footer>
+<footer><b>说明：</b>这是研究筛选工具，不构成投资建议；机会分不是上涨概率。支持全球资产机会分析；支持 A1 信号 +5/+10/+20/+40 日收益、超额收益和最大回撤跟踪；A类已拆分为 A1/A2/A3；A股采用申万行业，沪深300优先腾讯、备用新浪；全球资产优先新浪/FRED，必要时使用 ETF 代理。美元项使用 FRED 广义美元指数，并非 ICE DXY。Russell2000 / SOX / VIX 在原指数源不可用时可分别使用 IWM / SOXX / VIXY ETF 作为代理。公开接口可能存在延迟或临时不可用。</footer>
 </div></body></html>"""
 
 
@@ -2317,11 +2542,15 @@ def refresh_chatgpt_folder():
     keep_suffixes = (
         "_ChatGPT决策包.md",
         "_量化结果.csv",
+        "_机会对应标的.csv",
+        "_标的与监控.csv",
+        "_实际持仓.csv",
         "_全球资产.csv",
         "_A1信号验证.csv",
         "_A1验证统计.csv",
         "_给ChatGPT分析.md",
         "_基金投资板块分析.html",
+        "_Finance分析.html",
     )
     for f in sorted(DAILY_REPORTS.iterdir()):
         if f.is_file() and f.name.endswith(keep_suffixes):
@@ -2348,6 +2577,9 @@ def refresh_chatgpt_folder():
         "最新报告.html",
         "最新_ChatGPT决策包.md",
         "最新_量化结果.csv",
+        "最新_机会对应标的.csv",
+        "最新_标的与监控.csv",
+        "最新_实际持仓.csv",
         "最新_全球资产.csv",
         "最新_A1信号验证.csv",
     ]
@@ -2366,7 +2598,7 @@ def refresh_chatgpt_folder():
         if f.is_file() and f.name != ".gitkeep"
     ])
 
-    note = f"""基金投资板块分析 V1.0 — ChatGPT分析包
+    note = f"""Finance 分析 — ChatGPT分析包
 
 更新时间：{NOW}
 最新扫描时段：{SCAN_SLOT}
@@ -2408,8 +2640,8 @@ def refresh_chatgpt_folder():
         note, encoding="utf-8"
     )
 
-def main():
-    log(f"启动 V1.0：{SCAN_SLOT}扫描（{SCAN_TIME}） + 多时段留档 + ChatGPT决策包")
+def main(demo=False,monitor=None,target_fetcher=None):
+    log(f"启动 Finance 分析：{SCAN_SLOT}扫描（{SCAN_TIME}） + 多时段留档 + ChatGPT决策包")
     old=load_hist()
 
     log("获取沪深300基准...")
@@ -2417,6 +2649,7 @@ def main():
 
     log("获取申万一级 / 二级行业列表...")
     items,source_errors=sw_list()
+    source_errors=[f"沪深300基准：行情日期 {bm['date'].iloc[-1]:%Y-%m-%d}；来源 {bm.attrs.get('source','离线演示（模拟数据）' if demo else '未提供')}；{quote_status(bm)}"]+source_errors
     log(f"共 {len(items)} 个申万行业，开始扫描。首次运行会较慢。")
 
     results=[]; failures=[]; hist_map={}
@@ -2425,7 +2658,12 @@ def main():
         try:
             df=sw_hist(code)
             hist_map[(name,level)]=df
-            results.append(analyze(name,df,bm,level))
+            row=analyze(name,df,bm,level)
+            row["行业代码"]=str(code)
+            row["数据源"]=df.attrs.get("source", "离线演示（模拟数据）" if demo else "申万行业历史")
+            row["日期确认"]=df.attrs.get("date_confirmed", True)
+            row["数据状态"]=quote_status(df)
+            results.append(row)
         except Exception as e:
             failures.append((code,name,str(e)))
         if i%10==0 or i==len(items):
@@ -2455,23 +2693,36 @@ def main():
     stats=a1_signal_stats(signals)
 
     glob=global_data()
+    from .opportunities import build_targets
+    targets=build_targets(ROOT,ind.to_dict("records"),demo=demo,fetcher=target_fetcher)
+    securities=securities_frame(targets,monitor)
+    securities.to_csv(DAILY_REPORTS/f"{RUN_TAG}_标的与监控.csv",index=False,encoding="utf-8-sig")
+    securities.to_csv(LATEST_REPORTS/"最新_标的与监控.csv",index=False,encoding="utf-8-sig")
+    from ..portfolio import holdings_records
+    actual_holdings=pd.DataFrame(holdings_records(monitor),columns=['code','name','quantity','average_cost','note','updated_at']).rename(columns={
+        'code':'代码','name':'名称','quantity':'持有数量','average_cost':'平均成本','note':'备注','updated_at':'维护时间'})
+    actual_holdings.to_csv(DAILY_REPORTS/f"{RUN_TAG}_实际持仓.csv",index=False,encoding="utf-8-sig")
+    actual_holdings.to_csv(LATEST_REPORTS/"最新_实际持仓.csv",index=False,encoding="utf-8-sig")
+    target_data=target_frame(targets)
+    target_data.to_csv(DAILY_REPORTS/f"{RUN_TAG}_机会对应标的.csv",index=False,encoding="utf-8-sig")
+    target_data.to_csv(LATEST_REPORTS/"最新_机会对应标的.csv",index=False,encoding="utf-8-sig")
 
     csv=DAILY_REPORTS/f"{RUN_TAG}_量化结果.csv"
     ind.to_csv(csv,index=False,encoding="utf-8-sig")
     glob.to_csv(DAILY_REPORTS/f"{RUN_TAG}_全球资产.csv",index=False,encoding="utf-8-sig")
     signals.to_csv(DAILY_REPORTS/f"{RUN_TAG}_A1信号验证.csv",index=False,encoding="utf-8-sig")
     stats.to_csv(DAILY_REPORTS/f"{RUN_TAG}_A1验证统计.csv",index=False,encoding="utf-8-sig")
-    (DAILY_REPORTS/f"{RUN_TAG}_给ChatGPT分析.md").write_text(make_md(ind,glob,signals,stats),encoding="utf-8")
+    (DAILY_REPORTS/f"{RUN_TAG}_给ChatGPT分析.md").write_text(make_md(ind,glob,signals,stats,targets,monitor),encoding="utf-8")
 
-    html=make_html(ind,glob,source_errors,failures,signals,stats)
-    hp=DAILY_REPORTS/f"{RUN_TAG}_基金投资板块分析.html"; hp.write_text(html,encoding="utf-8")
+    html=make_html(ind,glob,source_errors,failures,signals,stats,targets,monitor)
+    hp=DAILY_REPORTS/f"{RUN_TAG}_Finance分析.html"; hp.write_text(html,encoding="utf-8")
     (LATEST_REPORTS/"最新报告.html").write_text(html,encoding="utf-8")
 
     save_hist(ind)
 
     # V1.0：生成给 ChatGPT 的完整决策包和滚动多日汇总
     history_now=load_hist()
-    decision_md=decision_pack_markdown(ind,glob,signals,stats,history_now)
+    decision_md=decision_pack_markdown(ind,glob,signals,stats,history_now,targets,monitor)
     (DAILY_REPORTS/f"{RUN_TAG}_ChatGPT决策包.md").write_text(decision_md,encoding="utf-8")
     (LATEST_REPORTS/"最新_ChatGPT决策包.md").write_text(decision_md,encoding="utf-8")
 
@@ -2499,7 +2750,7 @@ def main():
 
     refresh_chatgpt_folder()
     log(f"ChatGPT分析包 已自动刷新：本次 {SCAN_SLOT} 数据已归档，完整历史永久保留")
-    log(f"V1.0 决策包已生成：{LATEST_REPORTS} + {ROLLING_REPORTS}")
+    log(f"决策包已生成：{LATEST_REPORTS} + {ROLLING_REPORTS}")
     log("扫描完成")
     print(f"REPORT_PATH={hp}")
 

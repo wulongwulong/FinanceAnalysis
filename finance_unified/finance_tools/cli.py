@@ -1,4 +1,4 @@
-"""独立项目的分析入口与报告目录。"""
+"""Finance 分析：一次运行，一份报告。"""
 from __future__ import annotations
 import argparse
 import html
@@ -8,87 +8,73 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-NAMES = {'etf': 'ETF每日监控', 'sector': '板块与标的分析', 'fund': '基金板块与历史验证'}
-REPORTS = {
-    'etf': Path('etf/latest.html'),
-    'sector': Path('sector/latest.html'),
-    'fund': Path('fund/03_最新文件/最新报告.html'),
-}
+REPORT = Path('analysis/03_最新文件/最新报告.html')
 
 
-def build_index(root, statuses=None, demo=False, reports=None):
+def build_index(root, report=None, error=None):
     outputs = root / 'outputs'
     outputs.mkdir(parents=True, exist_ok=True)
-    rows = []
-    for task, name in NAMES.items():
-        relative = (reports or {}).get(task, REPORTS[task])
-        report = outputs / relative
-        status = (statuses or {}).get(task, '已有报告' if report.exists() else '尚未运行')
-        link = f'<a href="{relative.as_posix()}">查看报告</a>' if report.exists() else ''
-        modified = datetime.fromtimestamp(report.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S') if report.exists() else '—'
-        rows.append(f'<tr><td>{name}</td><td>{html.escape(status)}</td><td>{modified}</td><td>{link}</td></tr>')
-    title = 'Finance 综合分析' + (' · 离线演示（模拟数据）' if demo else '')
-    text = f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title>
-<style>body{{font:16px system-ui;max-width:1100px;margin:40px auto;padding:0 20px;color:#243047;background:#f7f9fc}}table{{border-collapse:collapse;width:100%;background:white}}td,th{{padding:18px;text-align:left;border-bottom:1px solid #e2e8f0}}a{{color:#245fca}}.scroll{{overflow:auto}}p{{line-height:1.7}}</style>
-<h1>{title}</h1><p>行业筛选 → 标的执行 → 日常监控与历史验证。报告更新于各模块运行时。</p>
-<div class="scroll"><table><tr><th>分析功能</th><th>本次状态</th><th>报告时间</th><th>报告入口</th></tr>{''.join(rows)}</table></div>
-<p>三套策略保留各自的分类和周线规则；同一标的出现不同信号时，请结合报告中的规则与时段比较。</p>
-<p>仅用于研究、量化筛选和决策辅助。</p></html>'''
     path = outputs / 'index.html'
-    path.write_text(text, encoding='utf-8')
+    if error is None:
+        shutil.copyfile(report or outputs / REPORT, path)
+    else:
+        path.write_text(
+            '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Finance 分析</title>'
+            '<h1>Finance 分析</h1>'
+            f'<p>本次分析失败：{html.escape(str(error))}</p>'
+            f'<p>运行时间：{datetime.now():%Y-%m-%d %H:%M:%S}</p>'
+            '<p>本页没有展示本次有效分析结果。请根据错误提示检查安装环境或行情接口后重试。</p></html>',
+            encoding='utf-8',
+        )
     return path
 
 
-def run_tasks(root, tasks, demo=False, mode='report', limit=0):
-    # 延迟导入：使用ETF或板块模块无需安装基金模块的第三方依赖。
-    from .etf.runner import run as run_etf
-    from .sector.runner import run as run_sector
-    from .fund.runner import run as run_fund
-
-    runners = {'etf': lambda: run_etf(root, demo=demo, mode=mode),
-               'sector': lambda: run_sector(root, demo=demo, limit=limit),
-               'fund': lambda: run_fund(root, demo=demo)}
-    statuses = {}
-    reports = {}
-    for task in tasks:
-        print(f'\n===== {NAMES[task]} =====', flush=True)
-        try:
-            result = runners[task]()
-            reports[task] = result.resolve().relative_to((root / 'outputs').resolve())
-            statuses[task] = '完成'
-            print(f'报告：{result}', flush=True)
-        except ModuleNotFoundError as error:
-            statuses[task] = f'失败：缺少依赖 {error.name}，请运行 安装环境.command'
-            print(statuses[task], flush=True)
-        except (Exception, SystemExit) as error:
-            statuses[task] = f'失败：{error}'
-            print(statuses[task], flush=True)
-    path = build_index(root, statuses, demo=demo, reports=reports)
-    print(f'\n统一报告入口：{path}')
-    return 1 if any(status.startswith('失败') for status in statuses.values()) else 0
+def run_analysis(root, demo=False, mode='report'):
+    try:
+        if mode == 'alert':
+            from .etf.runner import run
+            report = run(root, demo=demo, mode='alert')
+            print(f'标的提醒：{report}')
+            return 0
+        from .unified import run
+        report = run(root, demo=demo)
+        path = build_index(root, report=report)
+        print(f'\nFinance 分析报告：{path}')
+        return 0
+    except (Exception, SystemExit) as error:
+        message = f'缺少依赖 {error.name}，请先运行 安装环境.command' if isinstance(error, ModuleNotFoundError) else str(error)
+        path = build_index(root, error=message)
+        print(f'分析失败：{message}\n错误说明：{path}')
+        return 1
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Finance统一分析项目')
-    parser.add_argument('task', choices=[*NAMES, 'all'], nargs='?', default='all')
-    parser.add_argument('--demo', action='store_true', help='使用模拟数据；报告写入 outputs/demo，历史写入 data/demo')
-    parser.add_argument('--mode', choices=['report', 'alert'], default=None, help='ETF运行模式，默认 report')
-    parser.add_argument('--limit', type=int, default=None, help='板块与标的扫描数量，0表示全部')
+    parser = argparse.ArgumentParser(description='Finance 分析：新机会、标的判断、日常监控与历史验证')
+    # 保留旧命令与已安装定时任务兼容；正常启动都进入同一分析流程。
+    parser.add_argument('task', nargs='?', default='analyze', help=argparse.SUPPRESS)
+    parser.add_argument('--demo', action='store_true', help='使用模拟数据，报告和历史写入独立 demo 目录')
+    parser.add_argument('--mode', choices=['report', 'alert'], default='report', help='完整分析或标的提醒，默认完整分析')
+    parser.add_argument('--serve', action='store_true', help='分析后打开本机报告与持仓编辑服务')
+    parser.add_argument('--holdings', action='store_true', help='直接维护实际持仓，不扫描行情')
     args = parser.parse_args(argv)
-    if args.mode is not None and args.task not in ('etf', 'all'):
-        parser.error('--mode 仅适用于 etf / all')
-    if args.limit is not None and (args.task not in ('sector', 'all') or args.limit < 0):
-        parser.error('--limit 仅适用于 sector / all，且不能小于0')
-    tasks = list(NAMES) if args.task == 'all' else [args.task]
+    if args.task not in ('analyze', 'all', 'fund', 'sector', 'etf'):
+        parser.error('请直接运行 main.py，或使用 --demo / --mode alert')
+    if (args.serve or args.holdings) and (args.demo or args.mode == 'alert'):
+        parser.error('持仓编辑仅用于正式报告，不与演示或提醒模式组合')
+    if args.holdings:
+        from .portfolio import serve
+        serve(ROOT, edit=True)
+        return 0
     if not args.demo:
-        return run_tasks(ROOT, tasks, mode=args.mode or 'report', limit=args.limit or 0)
-
-    # 演示从空历史开始，结束后仅保存到独立的演示目录。
+        status = run_analysis(ROOT, mode=args.mode)
+        if args.serve:
+            from .portfolio import serve
+            serve(ROOT)
+        return status
     with tempfile.TemporaryDirectory() as directory:
         demo_root = Path(directory)
         shutil.copytree(ROOT / 'config', demo_root / 'config')
-        status = run_tasks(demo_root, tasks, demo=True, mode=args.mode or 'report', limit=args.limit or 0)
+        status = run_analysis(demo_root, demo=True, mode=args.mode)
         for folder in ('outputs', 'data'):
             if (demo_root / folder).exists():
                 shutil.copytree(demo_root / folder, ROOT / folder / 'demo', dirs_exist_ok=True)

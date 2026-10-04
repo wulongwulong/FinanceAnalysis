@@ -2,6 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime, date
 import html
+from ..common.report_dates import date_range
 
 
 def pct(v):
@@ -84,55 +85,17 @@ def _row_class(x):
     return {'转强': 'row-up', '转弱': 'row-down', '风险': 'row-risk', '混合': 'row-mix'}.get(x.get('signal_change_level'), 'row-change')
 
 
-def build(items, errors, out_dir: Path):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    md = out_dir / f'ETF每日技术监控_{stamp}.md'
-    ht = out_dir / f'ETF每日技术监控_{stamp}.html'
-    today = date.today().isoformat()
-    fresh_count = sum(1 for x in items if x.get('is_fresh'))
-    latest_market_date = max((x.get('date', '') for x in items), default='—')
-    changes = [x for x in items if x.get('is_significant_change')]
-
-    freshness = '今日行情已更新' if fresh_count else f'今日无新行情，最新行情日 {latest_market_date}；不写入重复正式信号'
-    lines = [
-        '# ETF每日技术监控 V1.0', '', f'生成时间：{datetime.now():%Y-%m-%d %H:%M:%S}', f'行情状态：{freshness}', '',
-        '规则：日线负责触发，周线负责确认/否决；技术动作对应默认目标仓位，`config/etf/position_grid.csv` 命中时网格仓位优先。', '',
-        '## 今日重要变化', ''
-    ]
-    if changes:
-        for x in changes:
-            lines.append(f"- **{x['code']} {x['name']}**｜{x['signal_change_text']}｜操作建议 {x['action_signal']} / 趋势{x['technical_state']} / 建仓{x['entry_state']} / 目标仓位{x['target_position_pct']:.0f}%")
-    else:
-        lines.append('- 本次无重要变化。')
-    lines += ['', '## 全部监控', '',
-        '|代码|名称|日期|收盘价|涨跌幅|技术动作|趋势状态|建仓状态|目标仓位|仓位来源|信号变化|日线状态|周线状态|周线确认|弱转强|波动风险/参考防守线|分析|',
-        '|---|---|---|---:|---:|---|---|---|---:|---|---|---|---|---|---|---|---|']
-    for x in items:
-        lines.append(
-            f"|{x['code']}|{x['name']}|{x['date']}|{x['close']:.3f}|{pct(x['pct_change'])}|{x['action_signal']}|{x['technical_state']}|"
-            f"{x['entry_state']}|{x['target_position_pct']:.0f}%|{x['position_source']}|{x['signal_change_text']}|{x['daily_text']}|{x['weekly_text']}|"
-            f"{x['weekly_confirmation']}|{_md_weak(x)}|{_risk_text(x)}|{x['analysis']}|"
-        )
-    if errors:
-        lines += ['', '## 数据异常', ''] + [f"- {e['code']} {e['name']}: {e['error']}" for e in errors]
-    lines += [
-        '',
-        '> 建仓状态是给当前空仓的人看的：暂不建仓 / 观察 / 试仓 / 确认建仓 / 强势建仓。试仓参考20%～30%，确认建仓参考30%～50%，强势建仓仍建议结合目标仓位分批执行。',
-        '> 默认仓位：空仓0%、卖出10%、减仓30%、持有50%、加仓70%、买入80%。目标仓位是建议配置比例，不是目标价格。',
-        '> 波动风险基于 ATR14/价格衡量振幅大小：低波动更稳定，高波动表示振幅更大、需要更谨慎；它不代表涨跌方向，也不直接改变技术动作。参考防守线 = 收盘价 - 2×ATR14。',
-        '> 历史正式信号只在收盘后写入 `data/etf/signals.csv`；盘中重要变化写入 `data/etf/events.csv`。',
-        '> 仅用于研究，不构成投资建议。'
-    ]
-    md.write_text('\n'.join(lines) + '\n', encoding='utf-8')
-
-    important_html = ''.join(
+def important_changes_html(items):
+    return ''.join(
         f"<div class='change-card {_row_class(x)}'><div class='change-title'>{_esc(x['code'])} {_esc(x['name'])}</div>"
         f"<div>{_change_badge(x.get('signal_change_level'), x.get('signal_change_text'))}</div>"
-        f"<div class='sub'>操作建议：{_action_badge(x['action_signal'])} ｜ 趋势{_state_badge(x['technical_state'])} ｜ 建仓{_entry_badge(x['entry_state'])} ｜ 目标仓位 <b>{x['target_position_pct']:.0f}%</b></div></div>"
-        for x in changes
+        f"<div class='sub'>技术动作：{_action_badge(x['action_signal'])} ｜ 趋势{_state_badge(x['technical_state'])} ｜ 建仓{_entry_badge(x['entry_state'])} ｜ 参考目标仓位 <b>{x['target_position_pct']:.0f}%</b></div></div>"
+        for x in items if x.get('is_significant_change')
     ) or "<div class='empty'>本次无重要变化。</div>"
 
+
+
+def monitoring_rows_html(items):
     rows = []
     for x in items:
         weak = _weak_badge(x['weak_turn_state'])
@@ -145,6 +108,77 @@ def build(items, errors, out_dir: Path):
             f"<td>{change}</td><td>{_esc(x['daily_text'])}</td><td>{_esc(x['weekly_text'])}</td><td>{_esc(x['weekly_confirmation'])}</td><td>{weak}</td>"
             f"<td>{_risk_badge(x)}<div class='tiny'>参考防守线 {defense}</div></td><td>{_esc(x['analysis'])}</td></tr>"
         )
+    return ''.join(rows)
+
+
+def monitoring_html(monitor):
+    items = [x for x in monitor or [] if x.get('action_signal')]
+    errors = [x for x in monitor or [] if x.get('error')]
+    headers = ['代码', '名称', '日期', '收盘价', '涨跌幅', '技术动作', '趋势状态', '建仓状态',
+               '参考目标仓位', '仓位来源', '信号变化', '日线状态', '周线状态', '周线确认', '弱转强', '波动风险', '分析']
+    rows = monitoring_rows_html(items)
+    rows += ''.join(f"<tr><td>{_esc(x['code'])}</td><td>{_esc(x['name'])}</td><td colspan='15'>分析失败：{_esc(x['error'])}</td></tr>" for x in errors)
+    css = """
+.daily-monitor .change-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin:12px 0 20px}
+.daily-monitor .change-card{border:1px solid #e5e7eb;border-radius:10px;padding:12px}.daily-monitor .change-title{font-weight:700;margin-bottom:7px}.daily-monitor .sub{margin-top:8px;color:#555}.daily-monitor .empty{color:#777;padding:10px 0}
+.daily-monitor .badge{display:inline-block;padding:2px 7px;border-radius:999px;font-weight:650;line-height:1.5;white-space:normal}
+.daily-monitor .pos{color:#b42318;background:#fff0ee}.daily-monitor .neg{color:#16794a;background:#edf8f1}.daily-monitor .neu{color:#175cd3;background:#eef4ff}.daily-monitor .warn{color:#a15c00;background:#fff4df}.daily-monitor .danger{color:#b42318;background:#ffe4e2}.daily-monitor .muted{color:#667085;background:#f2f4f7}.daily-monitor .mix{color:#6941c6;background:#f4f0ff}
+.daily-monitor .row-up{background:#fffafa}.daily-monitor .row-down{background:#f7fcf8}.daily-monitor .row-risk{background:#fffaf2}.daily-monitor .row-mix{background:#faf8ff}.daily-monitor .row-change{background:#fbfbfb}.daily-monitor .tiny{font-size:11px;color:#777;margin-top:3px}
+.daily-monitor th,.daily-monitor td{text-align:left;white-space:normal;vertical-align:top;min-width:55px;line-height:1.5}
+.daily-monitor td:nth-child(11),.daily-monitor td:nth-child(12),.daily-monitor td:nth-child(13),.daily-monitor td:nth-child(17){min-width:180px}
+.daily-monitor td:nth-child(16){min-width:130px}.daily-monitor th:first-child,.daily-monitor td:first-child{background:inherit}
+"""
+    return f"""<div class="daily-monitor"><style>{css}</style>
+<h3>今日重要变化</h3><div class="change-grid">{important_changes_html(items)}</div>
+<h3>全部监控</h3><div style="overflow:auto"><table><thead><tr>{''.join(f'<th>{h}</th>' for h in headers)}</tr></thead><tbody>{rows or '<tr><td colspan="17">暂无监控数据。</td></tr>'}</tbody></table></div></div>"""
+
+
+def build(items, errors, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    md = out_dir / f'ETF每日技术监控_{stamp}.md'
+    ht = out_dir / f'ETF每日技术监控_{stamp}.html'
+    today = date.today().isoformat()
+    fresh_count = sum(1 for x in items if x.get('is_fresh'))
+    market_date = date_range(x.get('date') for x in items)
+    latest_market_date = max((str(x['date']) for x in items if x.get('date')), default='—')
+    changes = [x for x in items if x.get('is_significant_change')]
+
+    freshness = '今日行情已更新' if fresh_count else f'今日无新行情，最新行情日 {latest_market_date}；不写入重复正式信号'
+    lines = [
+        '# ETF每日技术监控', '', f'生成时间：{datetime.now():%Y-%m-%d %H:%M:%S}', f'行情日期：{market_date or "—"}', f'行情状态：{freshness}', '',
+        '策略：日线触发、周线确认；技术动作对应默认参考目标仓位，`config/etf/position_grid.csv` 命中时网格仓位优先。',
+        '尚未接入实际持仓。技术动作和参考仓位不表示实际调仓量；仓位百分比的分母仍待确定。', '',
+        '## 今日重要变化', ''
+    ]
+    if changes:
+        for x in changes:
+            lines.append(f"- **{x['code']} {x['name']}**｜{x['signal_change_text']}｜技术动作 {x['action_signal']} / 趋势{x['technical_state']} / 建仓{x['entry_state']} / 参考目标仓位{x['target_position_pct']:.0f}%")
+    else:
+        lines.append('- 本次无重要变化。')
+    lines += ['', '## 全部监控', '',
+        '|代码|名称|日期|收盘价|涨跌幅|技术动作|趋势状态|建仓状态|参考目标仓位|仓位来源|信号变化|日线状态|周线状态|周线确认|弱转强|波动风险/参考防守线|分析|',
+        '|---|---|---|---:|---:|---|---|---|---:|---|---|---|---|---|---|---|---|']
+    for x in items:
+        lines.append(
+            f"|{x['code']}|{x['name']}|{x['date']}|{x['close']:.3f}|{pct(x['pct_change'])}|{x['action_signal']}|{x['technical_state']}|"
+            f"{x['entry_state']}|{x['target_position_pct']:.0f}%|{x['position_source']}|{x['signal_change_text']}|{x['daily_text']}|{x['weekly_text']}|"
+            f"{x['weekly_confirmation']}|{_md_weak(x)}|{_risk_text(x)}|{x['analysis']}|"
+        )
+    if errors:
+        lines += ['', '## 数据异常', ''] + [f"- {e['code']} {e['name']}: {e['error']}" for e in errors]
+    lines += [
+        '',
+        '> 建仓状态表示首次参与条件：暂不建仓 / 观察 / 试仓 / 确认建仓 / 强势建仓。它不读取实际持仓，也不单独决定参考仓位。',
+        '> 默认参考仓位：空仓0%、卖出10%、减仓30%、持有50%、加仓70%、买入80%。比例沿用现行规则，分母尚未确定。',
+        '> 波动风险基于 ATR14/价格衡量振幅大小：低波动更稳定，高波动表示振幅更大、需要更谨慎；它不代表涨跌方向，也不直接改变技术动作。参考防守线 = 收盘价 - 2×ATR14。',
+        '> 历史正式信号只在收盘后写入 `data/etf/signals.csv`；盘中重要变化写入 `data/etf/events.csv`。',
+        '> 仅用于研究，不构成投资建议。'
+    ]
+    md.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+    important_html = important_changes_html(items)
+    rows_html = monitoring_rows_html(items)
     css = """
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:28px;color:#222;background:#fff}
 h1{margin-bottom:6px}.meta{color:#666;margin-bottom:14px}.note{background:#f6f8fa;padding:14px 16px;border-radius:10px;margin:14px 0;line-height:1.75}
@@ -155,13 +189,14 @@ table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:8px;borde
 @media(max-width:900px){body{margin:14px}table{font-size:12px}.change-grid{grid-template-columns:1fr}}
 """
     errs = '' if not errors else '<h2>数据异常</h2><ul>' + ''.join(f"<li>{_esc(e['code'])} {_esc(e['name'])}: {_esc(e['error'])}</li>" for e in errors) + '</ul>'
-    html_text = f"""<!doctype html><meta charset='utf-8'><style>{css}</style>
-<h1>ETF每日技术监控 V1.0</h1><div class='meta'>生成时间：{datetime.now():%Y-%m-%d %H:%M:%S} ｜ {freshness}</div>
-<div class='note'><b>本版重点：</b>日线负责触发，周线负责确认/否决；“趋势状态”表示技术面强弱；“建仓状态”专门回答当前空仓是否适合首次建仓；“信号变化”突出今天相对上一交易日发生了什么；“波动风险”只表示振幅大小，不代表涨跌方向，也不直接改动作。<br>
-<b>建仓状态：</b>暂不建仓＝不参与；观察＝继续等信号；试仓＝可考虑20%～30%第一笔；确认建仓＝可考虑30%～50%分批建立；强势建仓＝强信号，仍建议结合目标仓位分批执行。<br>
+    html_text = f"""<!doctype html><meta charset='utf-8'><meta name="market-data-date" content="{_esc(market_date)}"><style>{css}</style>
+<h1>ETF每日技术监控</h1><div class='meta'>生成时间：{datetime.now():%Y-%m-%d %H:%M:%S} ｜ 行情日期：{_esc(market_date or '—')} ｜ {freshness}</div>
+<div class='note'><b>策略：</b>日线触发、周线确认；“趋势状态”表示技术面强弱；“建仓状态”说明首次参与条件；“信号变化”突出今天相对上一交易日发生了什么；“波动风险”只表示振幅大小，不代表涨跌方向，也不直接改动作。<br>
+<b>建仓状态：</b>暂不建仓 / 观察 / 试仓 / 确认建仓 / 强势建仓。状态不读取实际持仓，也不单独决定参考仓位。<br>
+<b>仓位口径：</b>尚未接入实际持仓，技术动作和参考仓位不表示实际调仓量；仓位百分比的分母仍待确定。<br>
 <b>默认仓位：</b>空仓0%、卖出10%、减仓30%、持有50%、加仓70%、买入80%。命中 <code>position_grid.csv</code> 时网格优先。</div>
 <h2>今日重要变化</h2><div class='change-grid'>{important_html}</div>
-<h2>全部监控</h2><div style='overflow:auto'><table><tr><th>代码</th><th>名称</th><th>日期</th><th>收盘价</th><th>涨跌幅</th><th>技术动作</th><th>趋势状态</th><th>建仓状态</th><th>目标仓位</th><th>来源</th><th>信号变化</th><th>日线状态</th><th>周线状态</th><th>周线确认</th><th>弱转强</th><th>波动风险</th><th>分析</th></tr>{''.join(rows)}</table></div>
+<h2>全部监控</h2><div style='overflow:auto'><table><tr><th>代码</th><th>名称</th><th>日期</th><th>收盘价</th><th>涨跌幅</th><th>技术动作</th><th>趋势状态</th><th>建仓状态</th><th>参考目标仓位</th><th>来源</th><th>信号变化</th><th>日线状态</th><th>周线状态</th><th>周线确认</th><th>弱转强</th><th>波动风险</th><th>分析</th></tr>{rows_html}</table></div>
 {errs}<p>仅用于研究，不构成投资建议。</p>"""
     ht.write_text(html_text, encoding='utf-8')
     (out_dir / 'latest.md').write_text(md.read_text(encoding='utf-8'), encoding='utf-8')

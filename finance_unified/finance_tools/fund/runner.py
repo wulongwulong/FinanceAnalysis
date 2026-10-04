@@ -5,13 +5,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-def run(root: Path, demo: bool = False) -> Path:
+def run(root: Path, demo: bool = False, monitor=None, target_fetcher=None) -> Path:
     from . import analyzer
 
     analyzer.configure_paths(root, demo=demo)
     try:
         if not demo:
-            return analyzer.main()
+            return analyzer.main(monitor=monitor,target_fetcher=target_fetcher)
 
         from ..common.demo import sector_rows
 
@@ -30,8 +30,10 @@ def run(root: Path, demo: bool = False) -> Path:
             ("801082", "半导体", "二级行业"),
             ("801751", "软件开发", "二级行业"),
         ]
+        # 固定模拟走势覆盖 A1/A2/C；分类仍由正式规则计算。
+        opportunity_seeds = {"801010": 120, "801082": 15, "801751": 64}
         histories = {
-            code: analyzer.norm(analyzer.pd.DataFrame(sector_rows(i + 1, 280, 1500 + i * 100)))
+            code: analyzer.norm(analyzer.pd.DataFrame(sector_rows(opportunity_seeds.get(code, i + 1), 280, 1500 + i * 100)))
             for i, (code, _, _) in enumerate(names)
         }
         benchmark = analyzer.norm(analyzer.pd.DataFrame(sector_rows(100, 280, 4000)))
@@ -46,6 +48,8 @@ def run(root: Path, demo: bool = False) -> Path:
             data = analyzer.pd.DataFrame(sector_rows(200 + i, 280, base))
             row = analyzer.analyze(name, data, None, "全球资产")
             row["数据源"] = "离线演示（模拟数据）"
+            row["数据状态"] = "日期已确认"
+            row["日期确认"] = True
             global_rows.append(row)
         with patch.multiple(
             analyzer,
@@ -54,7 +58,7 @@ def run(root: Path, demo: bool = False) -> Path:
             sw_hist=lambda code: histories[code].copy(),
             global_data=lambda: analyzer.pd.DataFrame(global_rows),
         ):
-            return analyzer.main()
+            return analyzer.main(demo=True,monitor=monitor,target_fetcher=target_fetcher)
     except Exception:
         (analyzer.LOG_REPORTS / f"{analyzer.RUN_TAG}_运行错误.txt").write_text(
             traceback.format_exc(), encoding="utf-8"

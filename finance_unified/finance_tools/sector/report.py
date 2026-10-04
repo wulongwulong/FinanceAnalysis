@@ -2,6 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
 import html
+from ..common.report_dates import date_range
 
 
 def _sector_location(sectors, sector_name: str) -> str:
@@ -86,13 +87,17 @@ def _row_class(state: str) -> str:
 def build(sectors, targets, globals_, errors, out_dir: Path, focus_count=5):
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    md = out_dir / f'板块与标的分析_V2.0_{stamp}.md'
-    ht = out_dir / f'板块与标的分析_V2.0_{stamp}.html'
-    data = out_dir / f'ChatGPT投资决策数据包_V2.0_{stamp}.md'
+    md = out_dir / f'板块与标的分析_{stamp}.md'
+    ht = out_dir / f'板块与标的分析_{stamp}.html'
+    data = out_dir / f'ChatGPT投资决策数据包_{stamp}.md'
+    market_date = date_range(x.get('date') for x in [*sectors, *targets])
+    strategy_note = '板块采用行业阶段与位置策略；标的采用日线打分、周线加权。这里的 C 是普通/高位观察，行业多周期报告的 C 是趋势机会，两者分别判断。'
+    position_note = '尚未接入实际持仓。技术动作和参考仓位不表示实际调仓量；仓位百分比的分母仍待确定，单标的上限不控制账户仓位合计。'
 
     lines = [
-        '# 板块与标的分析 V2.0', '',
-        f'生成时间：{datetime.now():%Y-%m-%d %H:%M:%S}', '',
+        '# 板块与标的分析', '',
+        f'生成时间：{datetime.now():%Y-%m-%d %H:%M:%S}', f'行情日期：{market_date or "—"}', '',
+        strategy_note, position_note, '',
         '## 一、核心逻辑', '',
         '- 上层：板块阶段 / 位置 / 相对沪深300决定“方向和仓位上限”。',
         '- 下层：ETF / 股票 / LOF 共用同一套技术动作规则：空仓0%、卖出10%、减仓30%、持有50%、加仓70%、买入80%。',
@@ -112,15 +117,15 @@ def build(sectors, targets, globals_, errors, out_dir: Path, focus_count=5):
         '', '## 三、重点板块对应标的执行', '',
         '### 标的执行字段说明', '',
         '- **标的技术动作**：只看该 ETF / 股票 / LOF 自身日线、周线、MACD、KDJ、均线、量能等得到的动作；默认对应空仓0%、卖出10%、减仓30%、持有50%、加仓70%、买入80%。',
-        '- **标的目标仓位**：标的技术动作对应的仓位；若命中 `config/position_grid.csv`，则优先使用网格仓位。',
+        '- **标的参考目标仓位**：标的技术动作对应的参考仓位；若命中 `config/sector/position_grid.csv`，则优先使用网格仓位。',
         '- **来源**：表示“标的目标仓位”如何确定。默认按标的技术动作映射仓位：空仓0%、卖出10%、减仓30%、持有50%、加仓70%、买入80%；如果当前价格命中 `config/position_grid.csv`，则采用对应网格仓位并显示为“价格网格”。价格网格优先于默认规则。来源只解释标的目标仓位的产生方式，不代表最终综合目标仓位。',
         '- **阶段上限**：板块阶段允许的最高仓位；当前规则 A1=50%、A2=70%、A3=35%、B=20%、C=0%。',
         '- **位置上限**：板块当前位置允许的最高仓位；当前规则 理想区=80%、合理区=70%、中性区=50%、偏高=30%。',
-        '- **综合目标**：标的目标仓位确定后，再结合阶段上限、位置上限及系统总上限取最小值，得到最终参考仓位。',
+        '- **综合参考目标**：标的参考目标确定后，再结合阶段上限、位置上限及单标的总上限取最小值。',
         '- **触发状态**：重点触发=A1/A2 + 理想区/合理区 + 标的技术动作至少为持有 + 综合目标≥50%；触发但位置不佳=A1/A2但位置偏高且综合目标>0；回踩观察=A3且综合目标>0；等待确认=B或尚未满足重点触发条件；不参与=C、综合目标=0或标的技术动作为空仓/卖出。',
         '- **综合建议**：结合标的动作、板块阶段和位置给出的文字结论。', '',
         '> 标的执行会在**全部已扫描板块**中，为 `config/target_mapping.csv` 里启用的 ETF / 股票 / LOF 寻找优先级最高的匹配板块。', '',
-        '|板块|板块阶段|当前位置|类型|标的|评级|标的技术动作|标的目标仓位|来源|阶段上限|位置上限|综合目标|触发状态|综合建议|',
+        '|板块|板块阶段|当前位置|类型|标的|信号评级|标的技术动作|标的参考目标|来源|阶段上限|位置上限|综合参考目标|触发状态|综合建议|',
         '|---|---|---|---|---|---|---|---:|---|---:|---:|---:|---|---|',
     ]
     for e in targets:
@@ -156,8 +161,9 @@ def build(sectors, targets, globals_, errors, out_dir: Path, focus_count=5):
     md.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
     pack = [
-        '# ChatGPT 投资决策数据包 V2.0', '',
-        f'数据日期：{datetime.now():%Y-%m-%d}', '',
+        '# ChatGPT 投资决策数据包', '',
+        f'数据日期：{market_date or "—"}', '',
+        strategy_note, position_note, '',
         '## 一、规则说明', '',
         'ETF / 股票 / LOF 技术动作统一对应：空仓0%、卖出10%、减仓30%、持有50%、加仓70%、买入80%；position_grid.csv 命中时网格目标优先。板块阶段/位置作为上层仓位上限，最终看“综合目标仓位”。', '',
         '## 二、TOP候选', '',
@@ -244,11 +250,12 @@ th{background:#f5f5f5}
     etf_note = """
 <div class='note'><b>标的执行字段说明：</b><br>
 <span class='item'><b>标的技术动作</b>：只看该 ETF / 股票 / LOF 自身技术面得到的动作；默认对应空仓0%、卖出10%、减仓30%、持有50%、加仓70%、买入80%。</span><br>
-<span class='item'><b>标的目标仓位</b>：标的技术动作对应的仓位；若命中 <code>config/position_grid.csv</code>，则优先使用网格仓位。</span><br>
+<span class='item'><b>标的参考目标仓位</b>：标的技术动作对应的参考仓位；若命中 <code>config/sector/position_grid.csv</code>，则优先使用网格仓位。</span><br>
 <span class='item'><b>来源</b>：表示“标的目标仓位”如何确定。默认按标的技术动作映射仓位；如果当前价格命中 <code>config/position_grid.csv</code>，则采用对应网格仓位并显示为“价格网格”。<b>价格网格优先于默认规则</b>。来源只解释标的目标仓位的产生方式，不代表最终综合目标仓位。</span><br>
 <span class='item'><b>阶段上限</b>：板块阶段允许的最高仓位；A1=50%、A2=70%、A3=35%、B=20%、C=0%。</span><br>
 <span class='item'><b>位置上限</b>：板块位置允许的最高仓位；理想区=80%、合理区=70%、中性区=50%、偏高=30%。</span><br>
-<span class='item'><b>综合目标</b>：标的目标仓位确定后，再结合阶段上限、位置上限及系统总上限取最小值，得到最终参考仓位。</span><br>
+<span class='item'><b>综合参考目标</b>：标的参考目标确定后，再结合阶段上限、位置上限及单标的总上限取最小值。</span><br>
+<span class='item'><b>信号评级</b>：反映板块与标的的技术条件，不代表实际仓位或需要调整的数量。</span><br>
 <span class='item'><b>触发状态</b>：<b>重点触发</b>=A1/A2 + 理想区/合理区 + 标的技术动作至少为持有 + 综合目标≥50%；<b>触发但位置不佳</b>=A1/A2但位置偏高且综合目标&gt;0；<b>回踩观察</b>=A3且综合目标&gt;0；<b>等待确认</b>=B或尚未满足重点触发条件；<b>不参与</b>=C、综合目标=0或标的技术动作为空仓/卖出。</span><br>
 <span class='item'><b>综合建议</b>：结合标的动作、板块阶段和位置给出的文字结论。</span><br>
 <span class='item'>标的执行会在全部已扫描板块中，为 <code>config/target_mapping.csv</code> 中启用的 ETF / 股票 / LOF 寻找优先级最高的匹配板块。</span>
@@ -257,9 +264,12 @@ th{background:#f5f5f5}
 
     ht.write_text(
         f"<!doctype html><meta charset='utf-8'><style>{css}</style>"
-        f"<h1>板块与标的分析 V2.0</h1>"
+        f'<meta name="market-data-date" content="{html.escape(market_date)}">'
+        f"<h1>板块与标的分析</h1>"
+        f"<p>行情日期：{html.escape(market_date or '—')}</p>"
+        f"<div class='note'>{html.escape(strategy_note)}<br>{html.escape(position_note)}</div>"
         "<div class='note'><b>参数说明：</b><br>"
-        "<span class='item'><b>阶段</b>：A1=低位刚转强，A2=转强确认，A3=启动后已加速，B=低位等待。</span><br>"
+        "<span class='item'><b>阶段</b>：A1=低位刚转强，A2=转强确认，A3=启动后已加速，B=低位等待，C=普通/高位观察。</span><br>"
         "<span class='item'><b>机会</b>：板块综合机会评分，越高代表越值得关注，不等于上涨概率。</span><br>"
         "<span class='item'><b>技术确认</b>：满分20分，综合 MA20、MACD、KDJ、BOLL、量能及相对沪深300表现；越高代表当前技术条件越充分。</span><br>"
         "<span class='item'><b>风险</b>：综合位置、过热与趋势衰减等风险，分数越高越需谨慎。</span><br>"
@@ -267,7 +277,7 @@ th{background:#f5f5f5}
         "<span class='item'><b>建议</b>：综合阶段、机会、技术确认、风险和位置后给出的当前操作建议。</span></div>"
         f"<h2>行业扫描</h2><table><tr><th>板块</th><th>阶段</th><th>机会</th><th>技术确认</th><th>风险</th><th>位置</th><th>建议</th></tr>{tr}</table>"
         f"<h2>标的执行</h2>{etf_note}"
-        f"<table><tr><th>板块</th><th>板块阶段</th><th>当前位置</th><th>类型</th><th>标的</th><th>评级</th><th>标的技术动作</th><th>标的目标仓位</th><th>来源</th><th>阶段上限</th><th>位置上限</th><th>综合目标</th><th>触发状态</th><th>综合建议</th></tr>{et}</table>"
+        f"<table><tr><th>板块</th><th>板块阶段</th><th>当前位置</th><th>类型</th><th>标的</th><th>信号评级</th><th>标的技术动作</th><th>标的参考目标</th><th>来源</th><th>阶段上限</th><th>位置上限</th><th>综合参考目标</th><th>触发状态</th><th>综合建议</th></tr>{et}</table>"
         "<p>仅用于研究，不构成投资建议。</p>",
         encoding='utf-8'
     )

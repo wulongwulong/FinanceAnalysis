@@ -1,7 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
-import csv
+from ..common.csv_history import read_history_csv, write_history_csv
 
 FIELDS = [
     "signal_date", "code", "name", "close", "action_signal", "trend_state", "entry_state",
@@ -12,22 +12,6 @@ EVENT_FIELDS = [
     "run_time", "signal_date", "code", "name", "action_signal", "trend_state", "entry_state",
     "weak_turn_state", "signal_change_level", "signal_change_text"
 ]
-
-
-def _read_csv(path: Path):
-    if not path.exists():
-        return []
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
-        return list(csv.DictReader(f))
-
-
-def _write_csv(path: Path, fields: list[str], rows: list[dict]):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        w.writeheader()
-        for row in rows:
-            w.writerow({k: row.get(k, "") for k in fields})
 
 
 def _max_drawdown_close(future: list[dict], entry: float, days: int = 20) -> float | None:
@@ -53,7 +37,7 @@ def _max_drawdown_close(future: list[dict], entry: float, days: int = 20) -> flo
 
 def update_history(path: Path, item: dict, enriched_daily: list[dict] | None = None):
     """只保存收盘正式信号；同一交易日同一代码只保留最终一条。"""
-    rows = _read_csv(path)
+    rows = read_history_csv(path, FIELDS, ('signal_date', 'code', 'close'))
     key = (str(item["date"]), item["code"])
     same_idx = None
     for i, r in enumerate(rows):
@@ -106,13 +90,13 @@ def update_history(path: Path, item: dict, enriched_daily: list[dict] | None = N
             if dd is not None:
                 r["max_drawdown_20"] = f"{dd:.2f}"
 
-    _write_csv(path, FIELDS, rows)
+    write_history_csv(path, FIELDS, rows)
 
 
 def record_event(path: Path, item: dict):
     if not item.get("is_significant_change"):
         return
-    rows = _read_csv(path)
+    rows = read_history_csv(path, EVENT_FIELDS, ('run_time', 'signal_date', 'code', 'action_signal'))
     payload = {
         "run_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "signal_date": item["date"], "code": item["code"], "name": item["name"],
@@ -125,4 +109,4 @@ def record_event(path: Path, item: dict):
     exists = any((r.get("signal_date"), r.get("code"), r.get("action_signal"), r.get("signal_change_text")) == key for r in rows)
     if not exists:
         rows.append(payload)
-        _write_csv(path, EVENT_FIELDS, rows)
+        write_history_csv(path, EVENT_FIELDS, rows)
